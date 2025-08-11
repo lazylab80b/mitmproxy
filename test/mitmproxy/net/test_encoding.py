@@ -117,19 +117,10 @@ def test_zstd():
     assert len(encoding.decode_zstd(two_frames)) == FRAME_SIZE * 2
 
 
-# ---- Tests for #7795: gzip missing trailer (CRC32/ISIZE) while the body is decodable. ----
+# Tests for #7795: gzip missing trailer (CRC32/ISIZE) but body is decodable.
+# Unit covers: (1) frozen synthetic, (2) dynamic multi-block, (3) guardrails (CRC/ISIZE).
+# Note: last-byte-missing is XFAIL (zlib commonly accepts it).
 class TestGzipMissingTrailerDecoding:
-    # We cover three groups:
-    #  1) Frozen synthetic hex: pre-generated truncated gzip (guards against future lib changes).
-    #  2) Dynamic synthetic hex: truncated gzip generated on the fly (long/multi-block payloads).
-    #  3) Guardrails: ensure we are not overly permissive on actually corrupted data:
-    #     a) flip a CRC32 byte
-    #     b) corrupt ISIZE (length)
-    #     c) last byte of the trailer missing
-    # [Note]
-    #   All patterns in group (3) should be detected as errors, but zlib commonly does not
-    #   detect (3c). We accept this for now and keep it XFAIL to document the policy.
-
     @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer (frozen synthetic)")
     def test_decode_gzip_missing_trailer_frozen(self):
         gz = bytes.fromhex(FROZEN_GZ_HEX)
