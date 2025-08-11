@@ -175,7 +175,7 @@ def _gzip_truncated_no_trailer(payload: bytes, splits: int = 1) -> bytes:
     for i in range(0, len(payload), step):
         gz.write(payload[i:i+step])
         gz.flush(zlib.Z_SYNC_FLUSH)  # force a block boundary; we do not finish the stream
-
+#    gz.close()
     data = buf.getvalue()  # read before close to avoid writing the trailer
     gz.close()
     assert data  # sanity
@@ -183,18 +183,26 @@ def _gzip_truncated_no_trailer(payload: bytes, splits: int = 1) -> bytes:
 
 
 # Local-only helper to print FROZEN_GZ_HEX and sanity-check stdlib gzip failure.
-# Run: uv run test/mitmproxy/net/test_encoding.py
-# copy outputed strings into constant definition section of this file.
+# Run this file and paste the printed block into the frozen constants section above.
+#   $ uv run python test/mitmproxy/net/test_encoding.py "payload text"
 if __name__ == "__main__":
-    gz = _gzip_truncated_no_trailer(FROZEN_PAYLOAD)
+    import sys
+
+    payload = sys.argv[1].encode("utf-8") if len(sys.argv) > 1 else FROZEN_PAYLOAD
+    gz = _gzip_truncated_no_trailer(payload)
     h = gz.hex()
-    print("FROZEN_GZ_HEX = (")
-    for i in range(0, len(h), 80):
-        print(f'    "{h[i:i+80]}"')
-    print(")")
 
     try:
         gzip.GzipFile(fileobj=io.BytesIO(gz)).read()
-        print("gzip: unexpected success (NG)")
     except EOFError:
-        print("gzip: expected EOFError (OK)")
+        print("gzip: expected EOFError detected (OK)")
+        print("# -- COPY FROM HERE --")
+        print(f"FROZEN_PAYLOAD = {payload!r}")
+        print("FROZEN_GZ_HEX = (")
+        for i in range(0, len(h), 80):
+            print(f'    "{h[i:i+80]}"')
+        print(")")
+        print("# -- TO HERE --")
+    else:
+        print("gzip: unexpected success (NG)")
+        sys.exit(1)
