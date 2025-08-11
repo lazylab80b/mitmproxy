@@ -117,18 +117,18 @@ def test_zstd():
     assert len(encoding.decode_zstd(two_frames)) == FRAME_SIZE * 2
 
 
-# ---- test case for #7795: gzip missing trailer (CRC/ISIZE), but body is decodable. ----
+# ---- Tests for #7795: gzip missing trailer (CRC32/ISIZE) while the body is decodable. ----
 class TestGzipMissingTrailerDecoding:
-    # we have three test cases:
-    #  1. Frozen synthetic hex: pre-syntesized broken data (guard for future change of gzip lib.)
-    #  2. Dynamic synthetic hex: dynamicaly syntesized broken data (for long/multiple blocks)
-    #  3. Guard rails: do not get overly permissive on actually corrupted data
-    #   a) flip LSB of CRC
-    #   b) wrong length (ISIZE field)
-    #   c) last byte of trailer missing
-    # [NOTE]
-    #   Though all three pattern of case-3 should detect data errror, but unfortunatly
-    #  zlib cannot detect (3-c). We can accept this case, but mark thils as XFAIL for future.
+    # We cover three groups:
+    #  1) Frozen synthetic hex: pre-generated truncated gzip (guards against future lib changes).
+    #  2) Dynamic synthetic hex: truncated gzip generated on the fly (long/multi-block payloads).
+    #  3) Guardrails: ensure we are not overly permissive on actually corrupted data:
+    #     a) flip a CRC32 byte
+    #     b) corrupt ISIZE (length)
+    #     c) last byte of the trailer missing
+    # [Note]
+    #   All patterns in group (3) should be detected as errors, but zlib commonly does not
+    #   detect (3c). We accept this for now and keep it XFAIL to document the policy.
 
     @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer (frozen synthetic)")
     def test_decode_gzip_missing_trailer_frozen(self):
@@ -138,14 +138,14 @@ class TestGzipMissingTrailerDecoding:
 
     @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer (dynamic)")
     def test_decode_gzip_missing_trailer_dynamic(self):
-        payload = b"TRUNCATED-DYNAMIC-" + b"A"*2048
-        # splits directive makes multiple chunks so we get multiple blocks
+        payload = b"TRUNCATED-DYNAMIC-" + b"A" * 2048
+        # The `splits` parameter forces multiple chunks so we get multiple blocks.
         gz = _gzip_truncated_no_trailer(payload, splits=3)
         out = encoding.decode_gzip(gz)
         assert out == payload
 
     def test_decode_gzip_crc_byte_flip(self):
-        good = gzip.compress(b"X"*64)
+        good = gzip.compress(b"X" * 64)
         bad = bytearray(good)
         bad[-5] ^= 0xFF  # damage CRC32
         with pytest.raises(Exception):
@@ -173,7 +173,7 @@ FROZEN_GZ_HEX = (
 def _gzip_truncated_no_trailer(payload: bytes, splits: int = 1) -> bytes:
     """
     Build a truncated gzip stream by flushing between chunks so the stream ends
-    without a gzip trailer. Commonly leaves 00 00 ff ff markers near boundaries.
+    without a gzip trailer. Commonly leaves 00 00 ff ff markers near block boundaries.
     """
     buf = io.BytesIO()
     gz = gzip.GzipFile(fileobj=buf, mode="wb")
@@ -182,11 +182,10 @@ def _gzip_truncated_no_trailer(payload: bytes, splits: int = 1) -> bytes:
     step = max(1, len(payload) // n)
     for i in range(0, len(payload), step):
         gz.write(payload[i:i+step])
-        gz.flush(zlib.Z_SYNC_FLUSH)  # force a block boundary; we do not finish the stream
+        gz.flush(zlib.Z_SYNC_FLUSH)  # force a block boundary; do not finish the stream
     data = buf.getvalue()  # read before close to avoid writing the trailer
     gz.close()
     return data
-
 
 # Local-only helper to print FROZEN_GZ_HEX and sanity-check stdlib gzip failure.
 # Run this file and paste the printed block into the frozen constants section above.
