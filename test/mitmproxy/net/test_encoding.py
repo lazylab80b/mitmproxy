@@ -116,72 +116,56 @@ def test_zstd():
     # Uncompressed two frames should have the size of FRAME_SIZE * 2
     assert len(encoding.decode_zstd(two_frames)) == FRAME_SIZE * 2
 
-# ---------------------------------------------------------------------------
-# Regression for #7795: gzip stream ends with Z_SYNC_FLUSH (00 00 ff ff),
-# gzip trailer (CRC32/ISIZE) is missing. We want lenient decode behavior.
-# ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="#7795: truncated gzip (Z_SYNC_FLUSH, no trailer)")
-def test_decode_gzip_syncflush_truncated_trailer_decodes():
-    """
-    Dynamic synthetic case:
-    - Build a truncated gzip stream that ends with Z_SYNC_FLUSH and has no trailer.
-    - Use multiple chunks to exercise multiple DEFLATE blocks.
-    """
-    payload = b"SYNCFLUSH-DYNAMIC-" + (b"A" * 1024) + (b"B" * 1024) + (b"C" * 1024)
-    gz = _gz_syncflush_no_trailer_multi(payload, splits=4)
-    out = encoding.decode_gzip(gz)
-    assert out == payload
+# ---- test case for #7795: gzip missing trailer (CRC/ISIZE), but body is decodable. ----
+class TestGzipMissingTrailerDecoding:
+    @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer (dynamic)")
+    def test_decode_gzip_missing_trailer_dynamic_decodes(self):
+        # dynamic synthetic: multiple chunks so we get multiple blocks
+        payload = b"TRUNCATED-DYNAMIC-" + b"A"*1024 + b"B"*1024 + b"C"*1024
+        gz = _gzip_truncated_no_trailer(payload, splits=4)
+        out = encoding.decode_gzip(gz)
+        assert out == payload
+
+    # ---- Frozen synthetic hex (not issue-derived). Fill by running __main__ below. ----
+    @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer (frozen synthetic)")
+    def test_decode_gzip_missing_trailer_frozen_decodes(self):
+        gz = bytes.fromhex(FROZEN_GZ_HEX)
+        out = encoding.decode_gzip(gz)
+        assert out == FROZEN_PAYLOAD
+
+    # ---- Guard rails: do not get overly permissive on actually corrupted data ----
+    def test_decode_gzip_crc_byte_flip(self):
+        good = gzip.compress(b"X"*64)
+        bad = bytearray(good)
+        bad[-5] ^= 0xFF  # damage CRC32
+        with pytest.raises(Exception):
+            encoding.decode_gzip(bytes(bad))
+
+    def test_decode_gzip_isize_byte_flip(self):
+        good = gzip.compress(b"HELLO")
+        bad = bytearray(good)
+        bad[-1] ^= 0xFF  # damage ISIZE LSB
+        with pytest.raises(Exception):
+            encoding.decode_gzip(bytes(bad))
+
+    @pytest.mark.xfail(strict=True, reason="Policy TBD: last-byte-missing may be accepted by zlib")
+    def test_decode_gzip_last_byte_missing(self):
+        good = gzip.compress(b"HELLO")
+        encoding.decode_gzip(good[:-1])
 
 
-# ---- Frozen synthetic hex (not issue-derived) ----
-# Fill FROZEN_GZ_HEX by running this file as a script (see __main__ below).
-FROZEN_PAYLOAD = b"SYNCFLUSH-FROZEN"
+# test-local helpers / constants (kept nearby for readability)
+
+FROZEN_PAYLOAD = b"TRUNCATED-FROZEN"
 FROZEN_GZ_HEX = (
     "__REPLACE_ME_WITH_GENERATED_HEX__"
 )
 
-@pytest.mark.xfail(strict=True, reason="#7795: truncated gzip (frozen synthetic)")
-def test_decode_gzip_syncflush_frozen_decodes():
-    """Frozen synthetic hex to guard against future library behavior changes."""
-    gz = bytes.fromhex(FROZEN_GZ_HEX)
-    out = encoding.decode_gzip(gz)
-    assert out == FROZEN_PAYLOAD
-
-
-# ---- Negative/guard cases: ensure we are not overly permissive ----
-
-def test_decode_gzip_crc_byte_flip_raises():
-    """Flip one byte in the CRC32 area: decoding should fail."""
-    good = gzip.compress(b"X" * 64)
-    bad = bytearray(good)
-    bad[-5] ^= 0xFF  # damage CRC32
-    with pytest.raises(Exception):
-        encoding.decode_gzip(bytes(bad))
-
-
-def test_decode_gzip_isize_byte_flip_raises():
-    """Flip one byte in ISIZE (last 4 bytes): decoding should fail."""
-    good = gzip.compress(b"HELLO")
-    bad = bytearray(good)
-    bad[-1] ^= 0xFF  # damage ISIZE LSB
-    with pytest.raises(Exception):
-        encoding.decode_gzip(bytes(bad))
-
-
-@pytest.mark.xfail(strict=True, reason="Policy TBD: last-byte-missing may be accepted by zlib")
-def test_decode_gzip_last_byte_missing_policy_tbd():
-    """Drop the very last byte; keep as xfail to document current uncertainty."""
-    good = gzip.compress(b"HELLO")
-    encoding.decode_gzip(good[:-1])
-
-
-# ---- Helpers (test-local) ----
-
-def _gz_syncflush_no_trailer_multi(payload: bytes, splits: int = 3) -> bytes:
+def _gzip_truncated_no_trailer(payload: bytes, splits: int = 1) -> bytes:
     """
-    Build a truncated gzip stream with multiple DEFLATE blocks by inserting
-    Z_SYNC_FLUSH between chunks. No gzip trailer is written (BFINAL stays 0).
+    Build a truncated gzip stream by flushing between chunks so the stream ends
+    without a gzip trailer. Commonly leaves 00 00 ff ff markers near boundaries.
     """
     buf = io.BytesIO()
     gz = gzip.GzipFile(fileobj=buf, mode="wb")
@@ -189,32 +173,28 @@ def _gz_syncflush_no_trailer_multi(payload: bytes, splits: int = 3) -> bytes:
     n = max(1, splits)
     step = max(1, len(payload) // n)
     for i in range(0, len(payload), step):
-        gz.write(payload[i : i + step])
-        gz.flush(zlib.Z_SYNC_FLUSH)  # forces a block boundary; emits 00 00 ff ff
+        gz.write(payload[i:i+step])
+        gz.flush(zlib.Z_SYNC_FLUSH)  # force a block boundary; we do not finish the stream
 
-    data = buf.getvalue()  # capture before closing to avoid writing the trailer
+    data = buf.getvalue()  # read before close to avoid writing the trailer
     gz.close()
-
-    # sanity: we should see at least `n` sync-flush markers (impl-dependent but typical for zlib)
-    assert data.count(b"\x00\x00\xff\xff") >= n
+    assert data  # sanity
     return data
 
 
-# Local-only generator:
-# - Emit FROZEN_GZ_HEX as adjacent string literals (copy/paste into the const above).
-# - Show that stdlib gzip fails with EOFError on this truncated stream.
-# Run:  python test/mitmproxy/net/test_encoding.py
+# Local-only helper to print FROZEN_GZ_HEX and sanity-check stdlib gzip failure.
+# Run: uv run test/mitmproxy/net/test_encoding.py
+# copy outputed strings into constant definition section of this file.
 if __name__ == "__main__":
-    gz = _gz_syncflush_no_trailer_multi(FROZEN_PAYLOAD, splits=3)
+    gz = _gzip_truncated_no_trailer(FROZEN_PAYLOAD)
     h = gz.hex()
     print("FROZEN_GZ_HEX = (")
     for i in range(0, len(h), 80):
         print(f'    "{h[i:i+80]}"')
     print(")")
 
-    import io as _io, gzip as _gzip
     try:
-        _gzip.GzipFile(fileobj=_io.BytesIO(gz)).read()
-        print("gzip: unexpected success")
+        gzip.GzipFile(fileobj=io.BytesIO(gz)).read()
+        print("gzip: unexpected success (NG)")
     except EOFError:
-        print("gzip: EOFError (expected)")
+        print("gzip: expected EOFError (OK)")
