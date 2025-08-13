@@ -1,38 +1,122 @@
-import io
-import sys
-import gzip
-import zlib
-import binascii
-from typing import Optional
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Cross-version probe for how stdlib gzip vs. zlib behave on various gzip edge cases.
 
-def gzip_truncated_no_trailer(payload: bytes, splits: int = 3) -> bytes:
+It prints:
+  - an environment header (Python/zlib build/runtime),
+  - a machine-readable ENV line,
+  - then a markdown table between "### BEGIN RESULTS" ... "### END RESULTS".
+
+The companion script summarize_results.py consumes the logs from multiple runs
+(e.g. different Python images) and renders a compact comparison matrix.
+"""
+from __future__ import annotations
+
+import binascii
+import gzip
+import io
+import platform
+import struct
+import zlib
+from typing import Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# helpers to craft gzip streams
+# ---------------------------------------------------------------------------
+
+def _gzip_ok(payload: bytes) -> bytes:
+    """Return a well-formed gzip member for payload (mtime=0 for determinism)."""
+    bio = io.BytesIO()
+    with gzip.GzipFile(fileobj=bio, mode="wb", mtime=0) as f:
+        f.write(payload)
+    return bio.getvalue()
+
+
+def _gzip_truncated_no_trailer(payload: bytes, splits: int = 1) -> bytes:
+    """
+    Build a gzip stream and *omit* the trailer by reading before close.
+    We also do Z_SYNC_FLUSH between chunks to induce multiple deflate blocks.
+    """
     buf = io.BytesIO()
     gz = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
-    step = max(1, len(payload) // max(1, splits))
+    n = max(1, int(splits))
+    step = max(1, len(payload) // n)
     for i in range(0, len(payload), step):
-        gz.write(payload[i:i+step])
+        chunk = payload[i:i + step]
+        gz.write(chunk)
+        # force a block boundary; *do not* finish the stream
         gz.flush(zlib.Z_SYNC_FLUSH)
-    data = buf.getvalue()
+    data = buf.getvalue()  # grab bytes *before* closing -> no trailer in output
     gz.close()
     return data
 
-def stdlib_gzip_read(data: bytes):
-    with gzip.GzipFile(fileobj=io.BytesIO(data)) as f:
-        return f.read()
 
-def zlib_recover_gzip(data: bytes) -> bytes:
-    decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    return decomp.decompress(data)
+def _flip_crc_byte(gz: bytes, which_from_end: int = 5) -> bytes:
+    """
+    Flip a CRC32 byte in the gzip trailer. Default flips the 3rd CRC byte
+    (counted from the end of the whole gzip member).
+    """
+    ba = bytearray(gz)
+    if len(ba) < 8:
+        return bytes(ba)
+    ba[-which_from_end] ^= 0xFF
+    return bytes(ba)
 
-def flip_crc_byte(gz_bytes: bytes) -> bytes:
-    b = bytearray(gz_bytes)
-    b[-5] ^= 0xFF
-    return bytes(b)
 
-def flip_isize_byte(gz_bytes: bytes) -> bytes:
-    b = bytearray(gz_bytes)
-    b[-1] ^= 0xFF
-    return bytes(b)
+def _flip_isize_lsb(gz: bytes) -> bytes:
+    """Flip the ISIZE LSB (last byte of the gzip member)."""
+    ba = bytearray(gz)
+    if not ba:
+        return bytes(ba)
+    ba[-1] ^= 0xFF
+    return bytes(ba)
+
+
+def _missing_last_byte(gz: bytes) -> bytes:
+    """Return gzip member with the very last byte cut off."""
+    if not gz:
+        return gz
+    return gz[:-1]
+
+
+# ---------------------------------------------------------------------------
+# engines under test
+# ---------------------------------------------------------------------------
+
+def run_stdlib_gzip(gz_bytes: bytes) -> Tuple[bool, Optional[int], Optional[str]]:
+    """
+    Try stdlib gzip to read the whole member. Returns (ok, out_len, err_name)
+    where err_name is None on success.
+    """
+    try:
+        out = gzip.GzipFile(fileobj=io.BytesIO(gz_bytes)).read()
+        return True, len(out), None
+    except Exception as e:  # EOFError, gzip.BadGzipFile, OSError, ...
+        return False, None, type(e).__name__
+
+
+def run_zlib_recover(gz_bytes: bytes) -> Tuple[bool, Optional[int], Optional[str]]:
+    """
+    Recover via zlib *gzip mode* but deliberately *not* validating at the end.
+    We stream-decompress and simply return any produced output; we do not call
+    .flush() and we don't force trailer checks. This means:
+      - truncated/missing trailer -> usually OK with output produced,
+      - CRC/ISIZE flipped -> zlib typically raises at end-of-stream parsing.
+    """
+    try:
+        d = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)  # gzip wrapper
+        out = d.decompress(gz_bytes)
+        # DO NOT call d.flush() here; we intentionally avoid final validations.
+        return True, len(out), None
+    except Exception as e:  # zlib.error, etc.
+        return False, None, "error"
+
+
+# ---------------------------------------------------------------------------
+# pretty print
+# ---------------------------------------------------------------------------
 
 def fmt_status(ok: bool, out_len: Optional[int], expect_len: int, err_name: Optional[str]) -> str:
     if ok:
@@ -40,57 +124,61 @@ def fmt_status(ok: bool, out_len: Optional[int], expect_len: int, err_name: Opti
     else:
         return f"ERR({err_name})"
 
-def main():
-    py = sys.version.split()[0]
-    print(f"Python {py} | zlib {zlib.ZLIB_VERSION}")
 
-    payload_short = b"HELLO WORLD!"
-    payload_long  = (b"SYNCFLUSH-" * 1024)  # 10KB超・複数ブロック狙い
+def print_table(rows):
+    print("### BEGIN RESULTS")
+    print("| case               |  in | expect | stdlib.gzip           | zlib.recover        |")
+    print("|--------------------|----:|-------:|-----------------------|---------------------|")
+    for r in rows:
+        print(f"| {r['case']:<18} | {r['in']:>3} | {r['expect']:>6} | {r['g_std']:<21} | {r['g_rec']:<19} |")
+    print("### END RESULTS")
+
+
+def main() -> None:
+    # Environment header (human + machine-readable)
+    zlib_build = getattr(zlib, "ZLIB_VERSION", "?")
+    zlib_rt = getattr(zlib, "ZLIB_RUNTIME_VERSION", zlib_build)
+    pyver = platform.python_version()
+    print(f"Python {pyver} | gzip stdlib | zlib build={zlib_build} runtime={zlib_rt}")
+    print(f"## ENV PY={pyver} GZIP=stdlib ZLIB_BUILD={zlib_build} ZLIB_RUNTIME={zlib_rt}")
+
+    # Cases
+    short_payload = b"HELLO WORLD!"  # 12 bytes
+    long_payload = b"A" * 10_240
+
     cases = [
-        ("truncated(short)", gzip_truncated_no_trailer(payload_short, splits=2), len(payload_short)),
-        ("truncated(long)",  gzip_truncated_no_trailer(payload_long,  splits=5), len(payload_long)),
-    ]
-    gz_ok = gzip.compress(b"A"*256, mtime=0)
-    cases += [
-        ("crc_flip",           flip_crc_byte(gz_ok),       256),
-        ("isize_flip",         flip_isize_byte(gz_ok),     256),
-        ("last_byte_missing",  gz_ok[:-1],                 256),
+        ("truncated(short)", _gzip_truncated_no_trailer(short_payload, splits=2), len(short_payload)),
+        ("truncated(long)", _gzip_truncated_no_trailer(long_payload, splits=3), len(long_payload)),
+        ("crc_flip", _flip_crc_byte(_gzip_ok(b"Z" * 256)), 256),
+        ("isize_flip", _flip_isize_lsb(_gzip_ok(b"Z" * 256)), 256),
+        ("last_byte_missing", _missing_last_byte(_gzip_ok(b"Z" * 256)), 256),
     ]
 
     rows = []
-    g_ok = z_ok = mismatches = 0
+    ok_std = ok_rec = 0
+    mismatches = []
 
-    print("### BEGIN RESULTS")
-    print("| case               | in  | expect | stdlib.gzip           | zlib.recover        |")
-    print("|--------------------|-----:|-------:|-----------------------|---------------------|")
+    for name, gz_bytes, expect_len in cases:
+        ok1, out_len1, err1 = run_stdlib_gzip(gz_bytes)
+        ok2, out_len2, err2 = run_zlib_recover(gz_bytes)
 
-    for name, data, expect_len in cases:
-        # stdlib gzip
-        g_status = ""
-        try:
-            gout = stdlib_gzip_read(data)
-            g_status = fmt_status(True, len(gout), expect_len, None)
-            g_ok += 1
-        except Exception as e:
-            g_status = fmt_status(False, None, expect_len, type(e).__name__)
+        rows.append({
+            "case": name,
+            "in": len(gz_bytes),
+            "expect": expect_len,
+            "g_std": fmt_status(ok1, out_len1, expect_len, err1),
+            "g_rec": fmt_status(ok2, out_len2, expect_len, err2),
+        })
+        ok_std += int(ok1)
+        ok_rec += int(ok2)
+        if (not ok1) and ok2:
+            mismatches.append(name)
 
-        # zlib recover
-        z_status = ""
-        try:
-            zout = zlib_recover_gzip(data)
-            z_status = fmt_status(True, len(zout), expect_len, None)
-            z_ok += 1
-        except Exception as e:
-            z_status = fmt_status(False, None, expect_len, type(e).__name__)
+    print_table(rows)
+    print(f"SUMMARY: stdlib.gzip OK {ok_std}/{len(cases)} | zlib.recover OK {ok_rec}/{len(cases)} | mismatches (gzip→ERR & zlib→OK): {len(mismatches)}")
+    if mismatches:
+        print("  " + ", ".join(mismatches))
 
-        if g_status.startswith("ERR(") and z_status.startswith("OK("):
-            mismatches += 1
-
-        print(f"| {name:18} | {len(data):3d} | {expect_len:6d} | {g_status:21} | {z_status:19} |")
-
-    print("### END RESULTS")
-    total = len(cases)
-    print(f"SUMMARY: stdlib.gzip OK {g_ok}/{total} | zlib.recover OK {z_ok}/{total} | mismatches (gzip→ERR & zlib→OK): {mismatches}")
 
 if __name__ == "__main__":
     main()
