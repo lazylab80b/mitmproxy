@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 BEG = "### BEGIN RESULTS"
 END = "### END RESULTS"
@@ -127,6 +127,7 @@ def parse_file(p: Path) -> dict | None:
         print(f"[warn] {p}: could not parse header/rows.")
         return None
 
+    # find decoder columns
     dec_cols: List[int] = []
     dec_names: List[str] = []
     for idx, name in enumerate(header):
@@ -140,7 +141,8 @@ def parse_file(p: Path) -> dict | None:
         print(f"[warn] {p}: no decoder columns found in header: {header}")
         return None
 
-    cases: Dict[str, Dict[str, str]] = {}
+    # collect rows -> case -> decoder -> (status, reason)
+    cases: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
     for r in rows:
         if not r:
             continue
@@ -148,8 +150,20 @@ def parse_file(p: Path) -> dict | None:
         cases[case] = {}
         for name, idx in zip(dec_names, dec_cols):
             cell = r[idx] if idx < len(r) else ""
-            status = "OK" if "OK" in cell else ("ERR" if "ERR" in cell else "")
-            cases[case][name] = status
+            # extract reason if present: ERR(EOFError) -> ("ERR","EOFError")
+            status = ""
+            reason: Optional[str] = None
+            if "OK" in cell:
+                status = "OK"
+                reason = None
+            elif "ERR" in cell:
+                status = "ERR"
+                m = re.search(r"ERR\(([^)]+)\)", cell)
+                reason = m.group(1) if m else ""
+            else:
+                status = ""
+                reason = None
+            cases[case][name] = {"status": status, "reason": reason}
 
     return {
         "file": str(p),
@@ -167,34 +181,6 @@ def vtuple(v: str) -> Tuple[int, int, int]:
         return int(a), int(b), int(c)
     except Exception:
         return (0, 0, 0)
-
-def build_table(runs: List[dict], decoder: str) -> str:
-    py_cols = sorted({r["python"] for r in runs}, key=vtuple)
-    all_cases = sorted({c for r in runs for c in r["cases"].keys()})
-    headers = ["case"] + py_cols
-
-    w0 = max(len("case"), max((len(c) for c in all_cases), default=4))
-    widths = [w0] + [max(len(py), 6) for py in py_cols]
-
-    def fmt_row(cells: List[str]) -> str:
-        return "| " + " | ".join(c.ljust(w) for c, w in zip(cells, widths)) + " |"
-
-    def fmt_sep() -> str:
-        return "|-" + "-|-".join("-" * w for w in widths) + "-|"
-
-    status: Dict[Tuple[str, str], str] = {}
-    for r in runs:
-        py = r["python"]
-        for case, decs in r["cases"].items():
-            s = decs.get(decoder, "")
-            if s:
-                status[(case, py)] = s
-
-    lines = [fmt_row(headers), fmt_sep()]
-    for case in all_cases:
-        row = [case] + [f"{status.get((case, py), ''):>3}" for py in py_cols]
-        lines.append(fmt_row(row))
-    return "\n".join(lines)
 
 def build_versions_table(runs: List[dict]) -> str:
     py_cols = sorted({r["python"] for r in runs}, key=vtuple)
@@ -214,13 +200,70 @@ def build_versions_table(runs: List[dict]) -> str:
         lines.append(f"| {py:<7} | {gz:<9} | {zb:<11} | {zr:<13} |")
     return "\n".join(lines)
 
+def build_table(runs: List[dict], decoder: str) -> str:
+    """
+    Columns = Python versions
+    First header cell label is 'python' (per request).
+    Insert an extra first row 'zlib(build)' with zlib build per Python.
+    Cell values: 'OK' or error reason only (e.g., 'EOFError', 'BadGzipFile').
+    """
+    py_cols = sorted({r["python"] for r in runs}, key=vtuple)
+    all_cases = sorted({c for r in runs for c in r["cases"].keys()})
+    headers = ["python"] + py_cols  # <- rename from 'case' to 'python'
+
+    # width calc: include label 'zlib(build)' and case names
+    w0 = max(len("python"), len("zlib(build)"), max((len(c) for c in all_cases), default=6))
+    widths = [w0] + [max(len(py), 6) for py in py_cols]
+
+    def fmt_row(cells: List[str]) -> str:
+        return "| " + " | ".join(c.ljust(w) for c, w in zip(cells, widths)) + " |"
+
+    def fmt_sep() -> str:
+        return "|-" + "-|-".join("-" * w for w in widths) + "-|"
+
+    # index by python for quick lookup and also zlib(build)
+    by_py: Dict[str, dict] = {}
+    for r in runs:
+        by_py[r["python"]] = r
+
+    # Build rows
+    lines = [fmt_row(headers)]
+
+    # zlib(build) row
+    zb_row = ["zlib(build)"] + [by_py.get(py, {}).get("zlib_build", "") for py in py_cols]
+    lines.append(fmt_row(zb_row))
+
+    lines.append(fmt_sep())
+
+    # case rows: cell = "OK" or reason text
+    for case in all_cases:
+        cells = [case]
+        for py in py_cols:
+            r = by_py.get(py)
+            disp = ""
+            if r:
+                entry = r["cases"].get(case, {}).get(decoder)
+                if entry:
+                    if entry["status"] == "OK":
+                        disp = "OK"
+                    elif entry["status"] == "ERR":
+                        # show only reason (may be empty string)
+                        disp = (entry["reason"] or "").strip()
+            cells.append(disp or "")
+        lines.append(fmt_row(cells))
+
+    return "\n".join(lines)
+
 def build_mismatches(runs: List[dict], a: str, b: str) -> str:
+    # unchanged, still useful as a quick diff (uses status only)
     all_cases = sorted({c for r in runs for c in r["cases"].keys()})
     by_case: Dict[str, List[str]] = {c: [] for c in all_cases}
     for r in runs:
         py = r["python"]
         for case, decs in r["cases"].items():
-            if decs.get(a) == "ERR" and decs.get(b) == "OK":
+            ea = decs.get(a, {})
+            eb = decs.get(b, {})
+            if ea.get("status") == "ERR" and eb.get("status") == "OK":
                 by_case[case].append(py)
 
     out = ["-- Recoverable mismatches ({}=ERR & {}=OK) --".format(a, b)]
@@ -254,6 +297,7 @@ def main():
         print("[error] No results parsed. Do your inputs contain the BEGIN/END block and a pipe-table?")
         return
 
+    # preserve decoder order of first occurrence
     decoders: List[str] = []
     seen = set()
     for r in runs:
@@ -265,7 +309,7 @@ def main():
     out_parts: List[str] = [build_versions_table(runs), ""]
 
     for dec in decoders:
-        out_parts.append(f"== {dec} (OK/ERR by Python) ==")
+        out_parts.append(f"== {dec} (OK or error reason by Python) ==")
         out_parts.append(build_table(runs, dec))
         out_parts.append("")
 
