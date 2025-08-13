@@ -1230,3 +1230,28 @@ class TestMessageText:
 
         with pytest.raises(json.decoder.JSONDecodeError):
             req.json()
+
+    @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer (issue-derived)")
+    def test_get_text_gzip_missing_trailer_issue7795(self):
+    # Regression for #7795: issue-provided truncated gzip (no trailer), but body is decodable.
+        hexdata = (
+            "1f8b08000000000000ffaa564a2d2a72ce4f4955b2d235d551502a4a2df12d4e57b2"
+            "527ab17efbb38d4d4f7b5a9fec58fb6cd3c267733a934a3353946a01000000ffff"
+        )
+        r = Response.make(
+            200,
+#            content=None,
+            headers={
+                "Content-Encoding": "gzip",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        # 圧縮済みの本体は raw_content へ
+        r.raw_content = bytes.fromhex(hexdata)
+
+        # 念のためガードを置くと早期に気づけます
+        assert r.headers["Content-Encoding"] == "gzip"
+        assert "charset=utf-8" in r.headers["Content-Type"].lower()
+
+        r.get_text(strict=True)
+        assert r.get_text(strict=True).startswith('{"errCode":-5')
