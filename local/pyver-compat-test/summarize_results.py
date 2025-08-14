@@ -22,72 +22,85 @@ def versplit(s: str) -> Tuple[int, ...]:
     except Exception:
         return (0,)
 
-def parse_file(p: Path) -> Dict:
-    """
-    Parse one log file produced by test_gzip_variants.py
-    Expected header (ENV line):
-      ## ENV PY=3.13.6 GZIP=stdlib ZLIB_BUILD=1.2.13 ZLIB_RUNTIME=1.2.13 PLATFORM=...
-    Table block:
-      ### BEGIN RESULTS ... ### END RESULTS
-    """
+def parse_file(path: str) -> Dict:
+    p = Path(path)
     text = p.read_text(encoding="utf-8", errors="replace")
 
-    # ランタイム情報（ENV）
-    runtime = {
-        "python": "unknown",
-        "gzip": "unknown",
-        "zlib_build": "unknown",
-        "zlib_runtime": "unknown",
-        "platform": "unknown",
-    }
-    m = re.search(
-        r"^##\s*ENV\s+PY=([\d.]+)\s+GZIP=(\w+)\s+ZLIB_BUILD=([\d.]+)\s+ZLIB_RUNTIME=([\d.]+)\s+PLATFORM=(.+)$",
-        text, re.MULTILINE,
-    )
-    if m:
-        runtime["python"], runtime["gzip"], runtime["zlib_build"], runtime["zlib_runtime"], runtime["platform"] = m.groups()
-
-    def normalize(cell: str) -> str:
-        cell = cell.strip()
-        if cell.startswith("OK("):
-            return "OK"
-        if cell.startswith("ERR(") and cell.endswith(")"):
-            inner = cell[4:-1].strip()
-            return inner or "error"
-        return "OK" if cell == "OK" else cell
-
-    # テーブル抽出
-    stdlib: Dict[str, str] = {}
-    zlibrec: Dict[str, str] = {}
-    in_table = False
+    # --- runtime line ---
+    py = zr = zb = gz = "unknown"
     for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("### BEGIN RESULTS"):
-            in_table = True
-            continue
-        if s.startswith("### END RESULTS"):
-            in_table = False
-            continue
-        if not in_table or not s.startswith("|"):
-            continue
+        if line.startswith("## ENV "):
+            parts = dict(kv.split("=", 1) for kv in line.split()[2:] if "=" in kv)
+            py = parts.get("PY", py)
+            zr = parts.get("ZLIB_RUNTIME", parts.get("ZLIB_RUNTIME_VERSION", zr))
+            zb = parts.get("ZLIB_BUILD", parts.get("ZLIB_VERSION", zb))
+            gz = parts.get("GZIP", gz)
+            break
 
-        cells = [c.strip() for c in s.strip("|").split("|")]
-        # ヘッダ/セパレータ行スキップ
-        if not cells:
-            continue
-        if cells[0].lower() in {"case"}:
-            continue
-        if set(cells[0]) == {"-"}:  # ---- 罫線
-            continue
+    verdicts: Dict[str, Dict[str, str]] = {"gzip": {}, "zlib": {}}
 
-        # 期待列: case | in | expect | gzip | zlib
-        if len(cells) >= 5:
-            case = cells[0]
-            if case in CASE_ORDER:
-                stdlib[case] = normalize(cells[3])
-                zlibrec[case] = normalize(cells[4])
+    # --- results block ---
+    lines = text.splitlines()
+    try:
+        i0 = lines.index("### BEGIN RESULTS") + 1
+        i1 = lines.index("### END RESULTS")
+    except ValueError:
+        # ブロックが無くても必ず verdicts を返す
+        return {
+            "runtime": {"python": py, "gzip": gz, "zlib_build": zb, "zlib_runtime": zr},
+            "python": py,
+            "zlib_runtime": zr,
+            "verdicts": verdicts,
+        }
 
-    return {"runtime": runtime, "cases": {"stdlib": stdlib, "zlib": zlibrec}, "file": str(p)}
+    block = lines[i0:i1]
+    header = next((ln for ln in block if ln.strip().startswith("|") and "case" in ln.lower()), None)
+    if header:
+        cols = [c.strip().lower() for c in header.strip().strip("|").split("|")]
+
+        # 列名の別名を正規化（ログは stdlib.gzip/zlib.recover、集計は gzip/zlib）
+        alias = {
+            "stdlib.gzip": "gzip",
+            "gzip stdlib": "gzip",
+            "gzip": "gzip",
+            "zlib.recover": "zlib",
+            "zlib": "zlib",
+        }
+        col_idx: Dict[str, int] = {}
+        for i, name in enumerate(cols):
+            if name in alias:
+                col_idx[alias[name]] = i
+
+        def conv(cell: str) -> str:
+            s = cell.strip()
+            if not s:
+                return ""
+            if s.startswith("OK"):
+                return "OK"
+            if s.startswith("ERR(") and s.endswith(")"):
+                return s[4:-1]  # ERR(Name) -> Name（例: EOFError, BadGzipFile）
+            if s.startswith("ERR"):
+                return "ERR"
+            return s  # 例: -3, -5, "error" など
+
+        for ln in block:
+            if not (ln.strip().startswith("|") and not set(ln.strip()) <= {"|", "-", " "}):
+                continue
+            parts = [c.strip() for c in ln.strip().strip("|").split("|")]
+            if len(parts) < 2 or parts[0].lower() in {"case", "python", "zlib(runtime)"}:
+                continue
+            case = parts[0]
+            if "gzip" in col_idx and col_idx["gzip"] < len(parts):
+                verdicts["gzip"][case] = conv(parts[col_idx["gzip"]])
+            if "zlib" in col_idx and col_idx["zlib"] < len(parts):
+                verdicts["zlib"][case] = conv(parts[col_idx["zlib"]])
+
+    return {
+        "runtime": {"python": py, "gzip": gz, "zlib_build": zb, "zlib_runtime": zr},
+        "python": py,
+        "zlib_runtime": zr,
+        "verdicts": verdicts,
+    }
 
 def compute_widths(rows: List[List[str]]) -> List[int]:
     w = [0] * max(len(r) for r in rows)
@@ -124,7 +137,7 @@ def render_runtime_table(runs: List[Dict]) -> str:
         rt = r["runtime"]
         rows.append([rt["python"], rt["gzip"], rt["zlib_build"], rt["zlib_runtime"]])
     widths = compute_widths(rows)
-    out = ["== Runtime versions ==", fmt_row(rows[0], widths), fmt_sep(widths)]
+    out = ["## Runtime versions", fmt_row(rows[0], widths), fmt_sep(widths)]
     out.extend(fmt_row(r, widths) for r in rows[1:])
     return "\n".join(out)
 
@@ -160,29 +173,56 @@ def make_verdict_maps(runs: List[Dict]) -> Tuple[Dict[str, Dict[Tuple[str, str],
                 verdict_zlib[case][key] = zl
     return verdict_stdlib, verdict_zlib
 
-# ---------- 表描画 ----------
+def _collect_col_pairs(runs: List[Dict[str, dict]]) -> list[tuple[str, str]]:
+    """ユニークな (python, zlib_runtime) の並びを昇順で返す。"""
+    pairs = {(r["runtime"]["python"], r["runtime"]["zlib_runtime"]) for r in runs}
+    return sorted(pairs, key=lambda t: (versplit(t[0]), versplit(t[1])))
 
-def render_verdict_table(title: str,
-                         verdict_map: Dict[str, Dict[Tuple[str, str], str]],
-                         runs: List[Dict]) -> str:
-    cols = collect_columns(runs)
-    # 見出し（2段）
-    head_py = ["python"] + [py for (py, _zr) in cols]
-    head_zr = ["zlib(runtime)"] + [_zr for (_py, _zr) in cols]
-    sep = ["------"] * len(head_py)
+def _build_verdict_index(runs: List[Dict], which: str) -> dict[str, dict[str, str]]:
+    """
+    which='gzip' | 'zlib'
+    case -> "py / zr" -> verdict に引けるインデックスを作る。
+    """
+    out: dict[str, dict[str, str]] = defaultdict(dict)
+    for r in runs:
+        py = r["runtime"]["python"]
+        zr = r["runtime"]["zlib_runtime"]
+        col = f"{py} / {zr}"
+        for case, v in r["verdicts"][which].items():
+            out[case][col] = v
+    return out
 
-    # 本体
-    body: List[List[str]] = []
+def render_verdict_table(
+    title: str,
+    verdicts: Dict[str, Dict[str, str]],
+    runs: List[Dict],
+    md_mode: bool = False,
+) -> str:
+    """
+    列キー（データ側）は常に "py / zr" で統一し、ヘッダ表示だけ md_mode で
+    1行( python/zlib ) / 2行( python / zlib(runtime) ) を出し分ける。
+    """
+    pairs = _collect_col_pairs(runs)
+    col_keys = [f"{py} / {zr}" for (py, zr) in pairs]
+
+    # まず全行を1つの rows に積む（幅計算を正しくするため）
+    rows: list[list[str]] = []
+    if md_mode:
+        rows.append(["python/zlib"] + col_keys)
+    else:
+        rows.append(["python"] + [py for (py, zr) in pairs])
+        rows.append(["zlib(runtime)"] + [zr for (py, zr) in pairs])
+    rows.append(["------"] + ["------"] * len(col_keys))
     for case in CASE_ORDER:
-        row = [case]
-        for key in cols:
-            row.append(verdict_map.get(case, {}).get(key, ""))
-        body.append(row)
+        rows.append([case] + [verdicts.get(case, {}).get(k, "") for k in col_keys])
 
-    rows = [head_py, head_zr, sep] + body
     widths = compute_widths(rows)
-    out = [title, fmt_row(head_py, widths), fmt_row(head_zr, widths), fmt_row(sep, widths)]
-    out.extend(fmt_row(r, widths) for r in body)
+    out = [title, fmt_row(rows[0], widths)]
+    if not md_mode:
+        out.append(fmt_row(rows[1], widths))
+    out.append(fmt_sep(widths))
+    start = 2 if md_mode else 3
+    out.extend(fmt_row(r, widths) for r in rows[start:])
     return "\n".join(out)
 
 # ---------- “環境差”の検出（新） ----------
@@ -198,7 +238,7 @@ def render_env_variation(runs: List[Dict]) -> str:
     verdict_stdlib, verdict_zlib = make_verdict_maps(runs)
 
     lines: List[str] = []
-    lines.append("\n-- Environment variation (per case; differences only) --")
+    lines.append("## Environment variation (per case; differences only)")
     for case in CASE_ORDER:
         # stdlib 側
         std_map = verdict_stdlib.get(case, {})
@@ -228,9 +268,9 @@ def render_env_variation(runs: List[Dict]) -> str:
         summarize_variation("zlib", zl_map, zl_values)
 
         if out_parts:
-            lines.append(f"{case}: " + " | ".join(out_parts))
+            lines.append(f"- {case}: " + " | ".join(out_parts))
         else:
-            lines.append(f"{case}: none")
+            lines.append(f"- {case}: none")
     return "\n".join(lines)
 
 # ---------- main ----------
@@ -244,18 +284,19 @@ def main():
 
     paths = [Path(p) for p in args.paths]
     runs = [parse_file(p) for p in paths]
-
-    verdict_stdlib, verdict_zlib = make_verdict_maps(runs)
+    md_mode = bool(args.md)
+    verdict_stdlib = _build_verdict_index(runs, "gzip")
+    verdict_zlib = _build_verdict_index(runs, "zlib")
     parts = [
         render_runtime_table(runs),
         "",
-        render_verdict_table("== gzip (OK or error reason by Python) ==", verdict_stdlib, runs),
+        render_verdict_table("## gzip (OK or error reason by Python)", verdict_stdlib, runs, md_mode=md_mode),
         "",
-        render_verdict_table("== zlib (OK or error reason by Python) ==", verdict_zlib, runs),
+        render_verdict_table("## zlib (OK or error reason by Python)", verdict_zlib, runs, md_mode=md_mode),
         "",
-        "Legend: zlib error codes",
-        "  -3: Z_DATA_ERROR (corrupt data / invalid checksum/length)",
-        "  -5: Z_BUF_ERROR (incomplete stream / needs more input)",
+        "**Legend (zlib error codes)**",
+        "- `-3`: Z_DATA_ERROR (corrupt data / invalid checksum/length)",
+        "- `-5`: Z_BUF_ERROR (incomplete stream / needs more input)",
         "",
         render_env_variation(runs),
     ]
