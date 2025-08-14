@@ -73,21 +73,21 @@ def parse_file(p: Path) -> Dict:
 
         cells = [c.strip() for c in s.strip("|").split("|")]
         # ヘッダ/セパレータ行スキップ
-        if not cells or cells[0] in {"case", "---"} or set(cells[0]) == {"-"}:
+        if not cells:
+            continue
+        if cells[0].lower() in {"case"}:
+            continue
+        if set(cells[0]) == {"-"}:  # ---- 罫線
             continue
 
-        # 期待列: case | in | expect | stdlib.gzip | zlib.recover
+        # 期待列: case | in | expect | gzip | zlib
         if len(cells) >= 5:
             case = cells[0]
             if case in CASE_ORDER:
                 stdlib[case] = normalize(cells[3])
                 zlibrec[case] = normalize(cells[4])
 
-    return {
-        "runtime": runtime,
-        "cases": {"stdlib": stdlib, "zlib": zlibrec},
-        "file": str(p),
-    }
+    return {"runtime": runtime, "cases": {"stdlib": stdlib, "zlib": zlibrec}, "file": str(p)}
 
 def compute_widths(rows: List[List[str]]) -> List[int]:
     w = [0] * max(len(r) for r in rows)
@@ -103,9 +103,21 @@ def fmt_sep(widths: List[int]) -> str:
     return "| " + " | ".join("-" * max(3, widths[i]) for i in range(len(widths))) + " |"
 
 def render_runtime_table(runs: List[Dict]) -> str:
+    seen = set()
+    uniq = []
+    for r in runs:
+        rt = r["runtime"]
+        key = (rt.get("python"), rt.get("zlib_runtime"))  # ← runtime から取る
+        if key not in seen:
+            uniq.append(r)
+            seen.add(key)
+
     runs_sorted = sorted(
-        runs,
-        key=lambda r: (versplit(r["runtime"]["python"]), versplit(r["runtime"]["zlib_runtime"]))
+        uniq,
+        key=lambda r: (
+            versplit(r["runtime"]["python"]),
+            versplit(r["runtime"]["zlib_runtime"]),
+        ),
     )
     rows = [["Python", "gzip", "zlib(build)", "zlib(runtime)"]]
     for r in runs_sorted:
@@ -148,6 +160,8 @@ def make_verdict_maps(runs: List[Dict]) -> Tuple[Dict[str, Dict[Tuple[str, str],
                 verdict_zlib[case][key] = zl
     return verdict_stdlib, verdict_zlib
 
+# ---------- 表描画 ----------
+
 def render_verdict_table(title: str,
                          verdict_map: Dict[str, Dict[Tuple[str, str], str]],
                          runs: List[Dict]) -> str:
@@ -155,8 +169,7 @@ def render_verdict_table(title: str,
     # 見出し（2段）
     head_py = ["python"] + [py for (py, _zr) in cols]
     head_zr = ["zlib(runtime)"] + [_zr for (_py, _zr) in cols]
-    # セパレータ用
-    sep = ["-" * 6] * len(head_py)
+    sep = ["------"] * len(head_py)
 
     # 本体
     body: List[List[str]] = []
@@ -172,49 +185,84 @@ def render_verdict_table(title: str,
     out.extend(fmt_row(r, widths) for r in body)
     return "\n".join(out)
 
-def render_mismatches(runs: List[Dict]) -> str:
+# ---------- “環境差”の検出（新） ----------
+
+def render_env_variation(runs: List[Dict]) -> str:
     """
-    各ケースごとに、"stdlib.gzip!=OK かつ zlib.recover=OK" の環境を列挙。
-    常に出力し、無ければ 'none' を出す。
+    各ケースごとに、環境（python,zlib_runtime）で結果がブレるかを検出。
+    ・gzip と zlib を別々に評価
+    ・全環境で同一なら 'none'
+    ・異なる値が混ざっていれば差分のみを列挙
     """
     cols = collect_columns(runs)
     verdict_stdlib, verdict_zlib = make_verdict_maps(runs)
 
     lines: List[str] = []
-    lines.append("\n-- Recoverable mismatches (stdlib.gzip!=OK & zlib.recover=OK) --")
+    lines.append("\n-- Environment variation (per case; differences only) --")
     for case in CASE_ORDER:
-        envs: List[str] = []
-        for (py, zr) in cols:
-            std = verdict_stdlib.get(case, {}).get((py, zr))
-            zl  = verdict_zlib.get(case, {}).get((py, zr))
-            if std is None or zl is None:
-                continue
-            if std != "OK" and zl == "OK":
-                envs.append(f"{py} (zr={zr})")
-        lines.append(f"{case}: " + (", ".join(envs) if envs else "none"))
+        # stdlib 側
+        std_map = verdict_stdlib.get(case, {})
+        std_values = {std_map.get(k, "") for k in cols if k in std_map}
+        # zlib 側
+        zl_map = verdict_zlib.get(case, {})
+        zl_values  = {zl_map.get(k, "") for k in cols if k in zl_map}
+
+        # すべて埋まっていない列は無視（安全側）
+        out_parts: List[str] = []
+
+        def summarize_variation(tag: str, vmap: Dict[Tuple[str,str], str], vset: set[str]) -> None:
+            if len([v for v in vset if v != ""]) <= 1:
+                return  # 変動なし
+            # 基準は最頻値（同数なら最初の値）
+            nonempty = [vmap.get(k, "") for k in cols if vmap.get(k, "") != ""]
+            baseline = max(set(nonempty), key=lambda v: nonempty.count(v)) if nonempty else ""
+            diffs = []
+            for (py, zr) in cols:
+                v = vmap.get((py, zr), "")
+                if v and v != baseline:
+                    diffs.append(f"{py}(zr={zr})->{v}")
+            if diffs:
+                out_parts.append(f"{tag} varies: " + ", ".join(diffs))
+
+        summarize_variation("gzip", std_map, std_values)
+        summarize_variation("zlib", zl_map, zl_values)
+
+        if out_parts:
+            lines.append(f"{case}: " + " | ".join(out_parts))
+        else:
+            lines.append(f"{case}: none")
     return "\n".join(lines)
+
+# ---------- main ----------
 
 def main():
     ap = argparse.ArgumentParser(description="Summarize gzip/zlib behavior across runtimes.")
     ap.add_argument("paths", nargs="+", help="log files like logs/out_*.txt")
     ap.add_argument("--md", action="store_true", help="also write summary.md")
+    ap.add_argument("--stdout-only", action="store_true", help="print to stdout only (no file)")
     args = ap.parse_args()
 
     paths = [Path(p) for p in args.paths]
     runs = [parse_file(p) for p in paths]
+
     verdict_stdlib, verdict_zlib = make_verdict_maps(runs)
     parts = [
         render_runtime_table(runs),
         "",
-        render_verdict_table("== stdlib.gzip (OK or error reason by Python) ==", verdict_stdlib, runs),
+        render_verdict_table("== gzip (OK or error reason by Python) ==", verdict_stdlib, runs),
         "",
-        render_verdict_table("== zlib.recover (OK or error reason by Python) ==", verdict_zlib, runs),
+        render_verdict_table("== zlib (OK or error reason by Python) ==", verdict_zlib, runs),
         "",
-        render_mismatches(runs),
+        "Legend: zlib error codes",
+        "  -3: Z_DATA_ERROR (corrupt data / invalid checksum/length)",
+        "  -5: Z_BUF_ERROR (incomplete stream / needs more input)",
+        "",
+        render_env_variation(runs),
     ]
     out = "\n".join(parts)
     print(out)
-    if args.md:
+
+    if args.md and not args.stdout_only:
         Path("summary.md").write_text(out + "\n", encoding="utf-8")
         print("[summarize_results] wrote: summary.md", file=sys.stderr)
 
