@@ -147,8 +147,15 @@ def identity(content):
 def decode_gzip(content: bytes) -> bytes:
     if not content:
         return b""
-    decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    return decomp.decompress(content)
+    try:
+        with gzip.GzipFile(fileobj=BytesIO(content)) as f:
+            return f.read()
+    except EOFError:
+        # fall back only if the stream ends with the DEFLATE Z_SYNC_FLUSH marker.
+        if len(content) >= 4 and content[-4:] == b"\x00\x00\xff\xff":
+            decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            return decomp.decompress(content)
+        raise
 
 
 def encode_gzip(content: bytes) -> bytes:
