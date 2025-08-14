@@ -1,5 +1,4 @@
-##### summarize_results.py (simplified)
-
+#!/usr/bin/env python3
 from __future__ import annotations
 import argparse
 import re
@@ -8,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from collections import defaultdict
 
-# 表示順
+# 表示順（test_gzip_variants.py の出力と対応）
 CASE_ORDER = [
     "truncated(short)",
     "truncated(long)",
@@ -26,26 +25,27 @@ def versplit(s: str) -> Tuple[int, ...]:
 def parse_file(p: Path) -> Dict:
     """
     Parse one log file produced by test_gzip_variants.py
-    Expected header (ENV line only):
+    Expected header (ENV line):
       ## ENV PY=3.13.6 GZIP=stdlib ZLIB_BUILD=1.2.13 ZLIB_RUNTIME=1.2.13 PLATFORM=...
-    And results block between:
+    Table block:
       ### BEGIN RESULTS ... ### END RESULTS
     """
     text = p.read_text(encoding="utf-8", errors="replace")
 
-    # ランタイム情報（ENV 行のみ対応）
+    # ランタイム情報（ENV）
     runtime = {
         "python": "unknown",
         "gzip": "unknown",
         "zlib_build": "unknown",
         "zlib_runtime": "unknown",
+        "platform": "unknown",
     }
     m = re.search(
-        r"^##\s*ENV\s+PY=([\d.]+)\s+GZIP=(\w+)\s+ZLIB_BUILD=([\d.]+)\s+ZLIB_RUNTIME=([\d.]+)",
+        r"^##\s*ENV\s+PY=([\d.]+)\s+GZIP=(\w+)\s+ZLIB_BUILD=([\d.]+)\s+ZLIB_RUNTIME=([\d.]+)\s+PLATFORM=(.+)$",
         text, re.MULTILINE,
     )
     if m:
-        runtime["python"], runtime["gzip"], runtime["zlib_build"], runtime["zlib_runtime"] = m.groups()
+        runtime["python"], runtime["gzip"], runtime["zlib_build"], runtime["zlib_runtime"], runtime["platform"] = m.groups()
 
     def normalize(cell: str) -> str:
         cell = cell.strip()
@@ -57,8 +57,8 @@ def parse_file(p: Path) -> Dict:
         return "OK" if cell == "OK" else cell
 
     # テーブル抽出
-    cases_stdlib: Dict[str, str] = {}
-    cases_zlib: Dict[str, str] = {}
+    stdlib: Dict[str, str] = {}
+    zlibrec: Dict[str, str] = {}
     in_table = False
     for line in text.splitlines():
         s = line.strip()
@@ -79,15 +79,13 @@ def parse_file(p: Path) -> Dict:
         # 期待列: case | in | expect | stdlib.gzip | zlib.recover
         if len(cells) >= 5:
             case = cells[0]
-            stdlib_cell = cells[3]
-            zlib_cell = cells[4]
             if case in CASE_ORDER:
-                cases_stdlib[case] = normalize(stdlib_cell)
-                cases_zlib[case] = normalize(zlib_cell)
+                stdlib[case] = normalize(cells[3])
+                zlibrec[case] = normalize(cells[4])
 
     return {
         "runtime": runtime,
-        "cases": {"stdlib": cases_stdlib, "zlib": cases_zlib},
+        "cases": {"stdlib": stdlib, "zlib": zlibrec},
         "file": str(p),
     }
 
@@ -95,8 +93,7 @@ def compute_widths(rows: List[List[str]]) -> List[int]:
     w = [0] * max(len(r) for r in rows)
     for r in rows:
         for i, c in enumerate(r):
-            if len(c) > w[i]:
-                w[i] = len(c)
+            w[i] = max(w[i], len(c))
     return w
 
 def fmt_row(cells: List[str], widths: List[int]) -> str:
@@ -120,108 +117,81 @@ def render_runtime_table(runs: List[Dict]) -> str:
     return "\n".join(out)
 
 def collect_columns(runs: List[Dict]) -> List[Tuple[str, str]]:
+    """
+    列IDとして (python, zlib_runtime) を採用。
+    見出し1段目は python、2段目は zlib(runtime) を表示。
+    """
     cols = {(r["runtime"]["python"], r["runtime"]["zlib_runtime"]) for r in runs}
     return sorted(cols, key=lambda x: (versplit(x[0]), versplit(x[1])))
 
-def _normalize_verdict(v: str | None) -> str | None:
+def make_verdict_maps(runs: List[Dict]) -> Tuple[Dict[str, Dict[Tuple[str, str], str]],
+                                                 Dict[str, Dict[Tuple[str, str], str]]]:
     """
-    ログ中のセル表記を「OK」or「理由文字列」に正規化する。
-    例: "OK(12/12)" -> "OK", "ERR(EOFError)" -> "EOFError", "error" -> "error"
-    """
-    if v is None:
-        return None
-    s = str(v).strip()
-    if s.startswith("OK"):
-        return "OK"
-    if s.startswith("ERR(") and s.endswith(")"):
-        return s[4:-1]
-    return s  # "error" などはそのまま
-
-def make_verdict_maps(runs: List[Dict]) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
-    """
-    各ケース×各Python版の判定表を作る。
+    各ケース×各( python, zlib_runtime ) の判定表を作る。
     return: (verdict_stdlib, verdict_zlib)
-            どちらも {case: {python_version: "OK" or 理由}} の形。
+            どちらも {case: {(py, zr): "OK" or 理由}} の形。
     """
-    verdict_stdlib: Dict[str, Dict[str, str]] = defaultdict(dict)
-    verdict_zlib: Dict[str, Dict[str, str]] = defaultdict(dict)
+    verdict_stdlib: Dict[str, Dict[Tuple[str, str], str]] = defaultdict(dict)
+    verdict_zlib: Dict[str, Dict[Tuple[str, str], str]] = defaultdict(dict)
 
     for r in runs:
-        py = r.get("python", "unknown")
-        # パーサが格納しているキーに幅を持たせて拾う
-        rows = r.get("results") or r.get("cases") or {}
-        for case, row in rows.items():
-            # 列名の揺れに対応
-            std = row.get("stdlib") or row.get("stdlib.gzip") or row.get("gzip") or row.get("stdlib_gzip")
-            zl  = row.get("zlib")   or row.get("zlib.recover") or row.get("recover") or row.get("zlib_recover")
-            std_n = _normalize_verdict(std)
-            zl_n  = _normalize_verdict(zl)
-            if std_n is not None:
-                verdict_stdlib[case][py] = std_n
-            if zl_n is not None:
-                verdict_zlib[case][py] = zl_n
-
+        py = r["runtime"]["python"]
+        zr = r["runtime"]["zlib_runtime"]
+        key = (py, zr)
+        cases = r.get("cases", {})
+        for case in CASE_ORDER:
+            std = cases.get("stdlib", {}).get(case)
+            zl  = cases.get("zlib", {}).get(case)
+            if std is not None:
+                verdict_stdlib[case][key] = std
+            if zl is not None:
+                verdict_zlib[case][key] = zl
     return verdict_stdlib, verdict_zlib
 
-def _zr_for(py: str, runs: list[dict]) -> str:
-    """指定 Python 版に対応する zlib(runtime) を取得"""
-    return next((r.get("zlib_runtime", "?") for r in runs if r.get("python") == py), "?")
+def render_verdict_table(title: str,
+                         verdict_map: Dict[str, Dict[Tuple[str, str], str]],
+                         runs: List[Dict]) -> str:
+    cols = collect_columns(runs)
+    # 見出し（2段）
+    head_py = ["python"] + [py for (py, _zr) in cols]
+    head_zr = ["zlib(runtime)"] + [_zr for (_py, _zr) in cols]
+    # セパレータ用
+    sep = ["-" * 6] * len(head_py)
 
-def render_verdict_table(title: str, verdict_map: dict[str, dict[str, str]], runs: list[dict]) -> str:
-    """
-    verdict_map を使って比較表を出力。
-    1行目: python 見出し
-    2行目: zlib(runtime)
-    罫線
-    以後: CASE_ORDER の順で各ケースの行
-    """
-    py_cols = collect_columns(runs)
-
-    def fmt_row(cells: list[str]) -> str:
-        # 各セルの最小幅をそろえるシンプル整形（すでに使っているやつがあればそれでOK）
-        widths = [max(len(str(c)), 6) for c in cells]
-        return "| " + " | ".join(f"{str(c):<{w}}" for c, w in zip(cells, widths)) + " |"
-
-    lines: list[str] = []
-    lines.append(title)
-    # 見出し2段
-    lines.append(fmt_row(["python"] + py_cols))
-    lines.append(fmt_row(["zlib(runtime)"] + [_zr_for(py, runs) for py in py_cols]))
-    # セパレータ
-    lines.append(fmt_row(["-" * 6] * (len(py_cols) + 1)))
     # 本体
+    body: List[List[str]] = []
     for case in CASE_ORDER:
         row = [case]
-        for py in py_cols:
-            cell = verdict_map.get(case, {}).get(py, "")
-            row.append(cell)
-        lines.append(fmt_row(row))
-    return "\n".join(lines)
+        for key in cols:
+            row.append(verdict_map.get(case, {}).get(key, ""))
+        body.append(row)
+
+    rows = [head_py, head_zr, sep] + body
+    widths = compute_widths(rows)
+    out = [title, fmt_row(head_py, widths), fmt_row(head_zr, widths), fmt_row(sep, widths)]
+    out.extend(fmt_row(r, widths) for r in body)
+    return "\n".join(out)
 
 def render_mismatches(runs: List[Dict]) -> str:
     """
     各ケースごとに、"stdlib.gzip!=OK かつ zlib.recover=OK" の環境を列挙。
-    1つも無ければ 'none' を出す。セクションは常に出力。
+    常に出力し、無ければ 'none' を出す。
     """
-    py_cols = collect_columns(runs)
+    cols = collect_columns(runs)
     verdict_stdlib, verdict_zlib = make_verdict_maps(runs)
 
     lines: List[str] = []
     lines.append("\n-- Recoverable mismatches (stdlib.gzip!=OK & zlib.recover=OK) --")
     for case in CASE_ORDER:
         envs: List[str] = []
-        for py in py_cols:
-            std = verdict_stdlib.get(case, {}).get(py)
-            zl  = verdict_zlib.get(case, {}).get(py)
+        for (py, zr) in cols:
+            std = verdict_stdlib.get(case, {}).get((py, zr))
+            zl  = verdict_zlib.get(case, {}).get((py, zr))
             if std is None or zl is None:
                 continue
             if std != "OK" and zl == "OK":
-                zr = next((rr.get("zlib_runtime", "?") for rr in runs if rr.get("python") == py), "?")
                 envs.append(f"{py} (zr={zr})")
-        if envs:
-            lines.append(f"{case}: " + ", ".join(envs))
-        else:
-            lines.append(f"{case}: none")
+        lines.append(f"{case}: " + (", ".join(envs) if envs else "none"))
     return "\n".join(lines)
 
 def main():
@@ -243,7 +213,6 @@ def main():
         render_mismatches(runs),
     ]
     out = "\n".join(parts)
-
     print(out)
     if args.md:
         Path("summary.md").write_text(out + "\n", encoding="utf-8")
