@@ -149,8 +149,10 @@ def collect_columns(runs: List[Dict]) -> List[Tuple[str, str]]:
     cols = {(r["runtime"]["python"], r["runtime"]["zlib_runtime"]) for r in runs}
     return sorted(cols, key=lambda x: (versplit(x[0]), versplit(x[1])))
 
-def make_verdict_maps(runs: List[Dict]) -> Tuple[Dict[str, Dict[Tuple[str, str], str]],
-                                                 Dict[str, Dict[Tuple[str, str], str]]]:
+def make_verdict_maps(runs: list[dict]) -> tuple[
+    dict[str, dict[tuple[str, str], str]],
+    dict[str, dict[tuple[str, str], str]],
+]:
     """
     各ケース×各( python, zlib_runtime ) の判定表を作る。
     return: (verdict_stdlib, verdict_zlib)
@@ -163,14 +165,11 @@ def make_verdict_maps(runs: List[Dict]) -> Tuple[Dict[str, Dict[Tuple[str, str],
         py = r["runtime"]["python"]
         zr = r["runtime"]["zlib_runtime"]
         key = (py, zr)
-        cases = r.get("cases", {})
-        for case in CASE_ORDER:
-            std = cases.get("stdlib", {}).get(case)
-            zl  = cases.get("zlib", {}).get(case)
-            if std is not None:
-                verdict_stdlib[case][key] = std
-            if zl is not None:
-                verdict_zlib[case][key] = zl
+        vmap = r.get("verdicts", {})
+        for case, v in vmap.get("gzip", {}).items():
+            verdict_stdlib[case][key] = v
+        for case, v in vmap.get("zlib", {}).items():
+            verdict_zlib[case][key] = v
     return verdict_stdlib, verdict_zlib
 
 def _collect_col_pairs(runs: List[Dict[str, dict]]) -> list[tuple[str, str]]:
@@ -304,7 +303,7 @@ def main():
     print(out)
 
     if args.md and not args.stdout_only:
-        Path("summary.md").write_text(out + "\n", encoding="utf-8")
+        Path("pyver-compat-summary.md").write_text(out + "\n", encoding="utf-8")
         print("[summarize_results] wrote: summary.md", file=sys.stderr)
 
 if __name__ == "__main__":
