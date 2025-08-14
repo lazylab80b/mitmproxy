@@ -1,214 +1,202 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Summarize gzip/zlib behavior across runs.
-
-- 既定: 標準出力に表示。--write <path> 指定時のみファイル保存。
-- 同一 Python でも zlib runtime が違えば別列（列キー=(python, zlib_runtime, gzip_kind)）。
-- 各表は「python 行」→「zlib(runtime) 行」→「zlib(build) 行」→区切り線→ケース行。
-- セル幅を列ごとに揃えてパディング（生Markdownでも整列）。
-- セルは OK / 具体的エラー理由 (EOFError, BadGzipFile, error) を表示。
-"""
+##### summarize_results.py (simplified)
 
 from __future__ import annotations
-import sys, re, argparse
+import argparse
+import re
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple
 
-HEADER_RE = re.compile(
-    r"^Python\s+(?P<py>[\d\.]+)\s*\|\s*gzip\s+(?P<gzip>\w+)\s*\|\s*zlib\s+build=(?P<zb>[\d\.]+)\s+runtime=(?P<zr>[\d\.]+)"
-)
-ROW_RE = re.compile(
-    r"^\|\s*(?P<case>[^|]+?)\s*\|\s*(?P<in>\d+)\s*\|\s*(?P<expect>\d+)\s*\|\s*(?P<gzip>OK\([^)]+\)|ERR\([^)]+\))\s*\|\s*(?P<zlib>OK\([^)]+\)|ERR\([^)]+\))\s*\|"
-)
+# 表示順
+CASE_ORDER = [
+    "truncated(short)",
+    "truncated(long)",
+    "crc_flip",
+    "isize_flip",
+    "last_byte_missing",
+]
 
-def parse_file(path: Path) -> Dict[str, Any]:
-    meta = {"python": None, "gzip_kind": None, "zlib_build": None, "zlib_runtime": None}
-    cases: Dict[str, Dict[str, str]] = {}
-    in_table = False
-
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not meta["python"]:
-            m = HEADER_RE.match(line.strip())
-            if m:
-                meta["python"] = m.group("py")
-                meta["gzip_kind"] = m.group("gzip")
-                meta["zlib_build"] = m.group("zb")
-                meta["zlib_runtime"] = m.group("zr")
-                continue
-        if line.strip().startswith("### BEGIN RESULTS"):
-            in_table = True
-            continue
-        if line.strip().startswith("### END RESULTS"):
-            in_table = False
-            continue
-        if not in_table:
-            continue
-        m = ROW_RE.match(line)
-        if m:
-            case = m.group("case").strip()
-            g = m.group("gzip")
-            z = m.group("zlib")
-            def norm(cell: str) -> str:
-                if cell.startswith("OK("):
-                    return "OK"
-                if cell.startswith("ERR(") and cell.endswith(")"):
-                    return cell[4:-1] or "error"
-                return cell
-            cases[case] = {"stdlib": norm(g), "zlib": norm(z)}
-    return {"meta": meta, "cases": cases, "path": str(path)}
-
-def ver_tuple(s: str) -> Tuple[int, ...]:
+def versplit(s: str) -> Tuple[int, ...]:
     try:
-        return tuple(int(x) for x in s.split("."))
+        return tuple(int(x) for x in re.findall(r"\d+", s)) or (0,)
     except Exception:
         return (0,)
 
-# ---------- 表整形（固定幅パディング） ----------
-def col_widths(rows: List[List[str]]) -> List[int]:
-    if not rows:
-        return []
-    n = max(len(r) for r in rows)
-    w = [0]*n
+def parse_file(p: Path) -> Dict:
+    """
+    Parse one log file produced by test_gzip_variants.py
+    Expected header (ENV line only):
+      ## ENV PY=3.13.6 GZIP=stdlib ZLIB_BUILD=1.2.13 ZLIB_RUNTIME=1.2.13 PLATFORM=...
+    And results block between:
+      ### BEGIN RESULTS ... ### END RESULTS
+    """
+    text = p.read_text(encoding="utf-8", errors="replace")
+
+    # ランタイム情報（ENV 行のみ対応）
+    runtime = {
+        "python": "unknown",
+        "gzip": "unknown",
+        "zlib_build": "unknown",
+        "zlib_runtime": "unknown",
+    }
+    m = re.search(
+        r"^##\s*ENV\s+PY=([\d.]+)\s+GZIP=(\w+)\s+ZLIB_BUILD=([\d.]+)\s+ZLIB_RUNTIME=([\d.]+)",
+        text, re.MULTILINE,
+    )
+    if m:
+        runtime["python"], runtime["gzip"], runtime["zlib_build"], runtime["zlib_runtime"] = m.groups()
+
+    def normalize(cell: str) -> str:
+        cell = cell.strip()
+        if cell.startswith("OK("):
+            return "OK"
+        if cell.startswith("ERR(") and cell.endswith(")"):
+            inner = cell[4:-1].strip()
+            return inner or "error"
+        return "OK" if cell == "OK" else cell
+
+    # テーブル抽出
+    cases_stdlib: Dict[str, str] = {}
+    cases_zlib: Dict[str, str] = {}
+    in_table = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("### BEGIN RESULTS"):
+            in_table = True
+            continue
+        if s.startswith("### END RESULTS"):
+            in_table = False
+            continue
+        if not in_table or not s.startswith("|"):
+            continue
+
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        # ヘッダ/セパレータ行スキップ
+        if not cells or cells[0] in {"case", "---"} or set(cells[0]) == {"-"}:
+            continue
+
+        # 期待列: case | in | expect | stdlib.gzip | zlib.recover
+        if len(cells) >= 5:
+            case = cells[0]
+            stdlib_cell = cells[3]
+            zlib_cell = cells[4]
+            if case in CASE_ORDER:
+                cases_stdlib[case] = normalize(stdlib_cell)
+                cases_zlib[case] = normalize(zlib_cell)
+
+    return {
+        "runtime": runtime,
+        "cases": {"stdlib": cases_stdlib, "zlib": cases_zlib},
+        "file": str(p),
+    }
+
+def compute_widths(rows: List[List[str]]) -> List[int]:
+    w = [0] * max(len(r) for r in rows)
     for r in rows:
-        for i, cell in enumerate(r):
-            w[i] = max(w[i], len(cell))
+        for i, c in enumerate(r):
+            if len(c) > w[i]:
+                w[i] = len(c)
     return w
 
-def fmt_row_pad(row: List[str], widths: List[int]) -> str:
-    cells = []
-    for i, cell in enumerate(row):
-        pad = widths[i] - len(cell)
-        cells.append(cell + (" " * pad))
-    return "| " + " | ".join(cells) + " |"
+def fmt_row(cells: List[str], widths: List[int]) -> str:
+    return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
 
-def fmt_sep_pad(widths: List[int]) -> str:
-    return "| " + " | ".join("-" * max(3, w) for w in widths) + " |"
-# --------------------------------------------------
+def fmt_sep(widths: List[int]) -> str:
+    return "| " + " | ".join("-" * max(3, widths[i]) for i in range(len(widths))) + " |"
 
-def build_summary(runs: List[Dict[str, Any]]) -> str:
-    # 列キー: (python, zlib_runtime, gzip_kind)
-    colkeys: List[Tuple[str, str, str]] = []
-    meta_by_col: Dict[Tuple[str, str, str], Dict[str, str]] = {}
-    cases_union: List[str] = []
+def render_runtime_table(runs: List[Dict]) -> str:
+    runs_sorted = sorted(
+        runs,
+        key=lambda r: (versplit(r["runtime"]["python"]), versplit(r["runtime"]["zlib_runtime"]))
+    )
+    rows = [["Python", "gzip", "zlib(build)", "zlib(runtime)"]]
+    for r in runs_sorted:
+        rt = r["runtime"]
+        rows.append([rt["python"], rt["gzip"], rt["zlib_build"], rt["zlib_runtime"]])
+    widths = compute_widths(rows)
+    out = ["== Runtime versions ==", fmt_row(rows[0], widths), fmt_sep(widths)]
+    out.extend(fmt_row(r, widths) for r in rows[1:])
+    return "\n".join(out)
 
-    for r in runs:
-        m = r["meta"]
-        py = m["python"] or "unknown"
-        zr = m["zlib_runtime"] or "unknown"
-        gk = m["gzip_kind"] or "unknown"
-        key = (py, zr, gk)
-        if key not in meta_by_col:
-            meta_by_col[key] = {
-                "python": py,
-                "gzip_kind": gk,
-                "zlib_build": m["zlib_build"] or "unknown",
-                "zlib_runtime": zr,
-            }
-            colkeys.append(key)
-        for c in r["cases"].keys():
-            if c not in cases_union:
-                cases_union.append(c)
+def collect_columns(runs: List[Dict]) -> List[Tuple[str, str]]:
+    cols = {(r["runtime"]["python"], r["runtime"]["zlib_runtime"]) for r in runs}
+    return sorted(cols, key=lambda x: (versplit(x[0]), versplit(x[1])))
 
-    colkeys.sort(key=lambda k: (ver_tuple(k[0]), ver_tuple(k[1]), k[2]))
-    py_cols = [meta_by_col[k]["python"] for k in colkeys]
-    zr_cols = [meta_by_col[k]["zlib_runtime"] for k in colkeys]
-    zb_cols = [meta_by_col[k]["zlib_build"] for k in colkeys]
+def index_runs_by_col(runs: List[Dict]) -> Dict[Tuple[str, str], Dict]:
+    return {(r["runtime"]["python"], r["runtime"]["zlib_runtime"]): r for r in runs}
 
-    out_lines: List[str] = []
+def render_summary_table(title: str, engine: str, runs: List[Dict]) -> str:
+    cols = collect_columns(runs)
+    idx = index_runs_by_col(runs)
 
-    # == Runtime versions ==
-    out_lines.append("== Runtime versions ==")
-    rv_rows = [
-        ["Python", "gzip", "zlib(build)", "zlib(runtime)"],
-    ]
-    for k in colkeys:
-        md = meta_by_col[k]
-        rv_rows.append([md["python"], md["gzip_kind"], md["zlib_build"], md["zlib_runtime"]])
-    w = col_widths(rv_rows)
-    out_lines.append(fmt_row_pad(rv_rows[0], w))
-    out_lines.append(fmt_sep_pad(w))
-    for r in rv_rows[1:]:
-        out_lines.append(fmt_row_pad(r, w))
-    out_lines.append("")
+    header1 = ["python"] + [py for (py, zr) in cols]
+    header2 = ["zlib(runtime)"] + [zr for (py, zr) in cols]
 
-    def build_matrix(title: str, which: str) -> None:
-        out_lines.append(f"== {title} (OK or error reason by Python) ==")
-        # ヘッダ3行 + 区切り + ケース行
-        rows: List[List[str]] = []
-        rows.append(["python"] + py_cols)
-        rows.append(["zlib(runtime)"] + zr_cols)
-        rows.append(["zlib(build)"] + zb_cols)
-        # ダミーで区切り計算に含めないため、後で sep を挿入
-        for case in cases_union:
-            row = [case]
-            for k in colkeys:
-                val = ""
-                for r in runs:
-                    m = r["meta"]
-                    if (m["python"] or "unknown", m["zlib_runtime"] or "unknown", m["gzip_kind"] or "unknown") != k:
-                        continue
-                    d = r["cases"].get(case)
-                    if d:
-                        v = d["stdlib" if which == "stdlib" else "zlib"]
-                        val = v
-                row.append(val or "")
-            rows.append(row)
+    body_rows: List[List[str]] = []
+    for case in CASE_ORDER:
+        row = [case]
+        for (py, zr) in cols:
+            cell = idx.get((py, zr), {}).get("cases", {}).get(
+                "stdlib" if engine == "stdlib" else "zlib", {}
+            ).get(case, "")
+            row.append(cell)
+        body_rows.append(row)
 
-        widths = col_widths(rows)
-        # ヘッダ3行
-        out_lines.append(fmt_row_pad(rows[0], widths))
-        out_lines.append(fmt_row_pad(rows[1], widths))
-        out_lines.append(fmt_row_pad(rows[2], widths))
-        # 区切り線
-        out_lines.append(fmt_sep_pad(widths))
-        # ケース
-        for r in rows[3:]:
-            out_lines.append(fmt_row_pad(r, widths))
-        out_lines.append("")
+    rows = [header1, header2] + body_rows
+    widths = compute_widths(rows)
+    lines = [f"== {title} (OK or error reason by Python) ==",
+             fmt_row(header1, widths),
+             fmt_row(header2, widths),
+             fmt_sep(widths)]
+    lines.extend(fmt_row(r, widths) for r in body_rows)
+    return "\n".join(lines)
 
-    build_matrix("stdlib.gzip", which="stdlib")
-    build_matrix("zlib.recover", which="zlib")
+def render_mismatches(runs: List[Dict]) -> str:
+    cols = collect_columns(runs)
+    idx = index_runs_by_col(runs)
 
-    # mismatches
-    out_lines.append("-- Recoverable mismatches (stdlib.gzip=ERR & zlib.recover=OK) --")
-    labels = [f'{meta_by_col[k]["python"]} (zr={meta_by_col[k]["zlib_runtime"]})' for k in colkeys]
-    for case in cases_union:
-        hit: List[str] = []
-        for i, k in enumerate(colkeys):
-            std = rec = None
-            for r in runs:
-                m = r["meta"]
-                if (m["python"] or "unknown", m["zlib_runtime"] or "unknown", m["gzip_kind"] or "unknown") != k:
-                    continue
-                d = r["cases"].get(case)
-                if d:
-                    std = d["stdlib"]
-                    rec = d["zlib"]
-            if std and rec and std != "OK" and rec == "OK":
-                hit.append(labels[i])
-        if hit:
-            out_lines.append(f"{case}: " + ", ".join(hit))
-    out_lines.append("")
-    return "\n".join(out_lines)
+    def label(py: str, zr: str) -> str:
+        return f"{py} (zr={zr})"
+
+    lines = ["-- Recoverable mismatches (stdlib.gzip=ERR & zlib.recover=OK) --"]
+    for case in CASE_ORDER:
+        spots = []
+        for (py, zr) in cols:
+            r = idx.get((py, zr))
+            if not r:
+                continue
+            stdlib_res = r["cases"]["stdlib"].get(case, "")
+            zlib_res = r["cases"]["zlib"].get(case, "")
+            if stdlib_res and stdlib_res != "OK" and zlib_res == "OK":
+                spots.append(label(py, zr))
+        if spots:
+            lines.append(f"{case}: " + ", ".join(spots))
+    return "\n".join(lines)
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--write", metavar="PATH", help="Write summary to PATH as well.")
-    ap.add_argument("paths", nargs="*", help="Input log files (glob-expanded by shell).")
+    ap = argparse.ArgumentParser(description="Summarize gzip/zlib behavior across runtimes.")
+    ap.add_argument("paths", nargs="+", help="log files like logs/out_*.txt")
+    ap.add_argument("--md", action="store_true", help="also write summary.md")
     args = ap.parse_args()
 
-    paths = [Path(p) for p in args.paths] if args.paths else sorted(Path("logs").glob("out_*.txt"))
-    runs = [parse_file(p) for p in paths if p.exists()]
-    if not runs:
-        print("No inputs.", file=sys.stderr)
-        sys.exit(2)
+    paths = [Path(p) for p in args.paths]
+    runs = [parse_file(p) for p in paths]
 
-    summary = build_summary(runs)
-    print(summary)  # 既定は標準出力
-    if args.write:
-        Path(args.write).write_text(summary, encoding="utf-8")
-        print(f"[summarize_results] wrote: {args.write}", file=sys.stderr)
+    parts = [
+        render_runtime_table(runs),
+        "",
+        render_summary_table("stdlib.gzip", "stdlib", runs),
+        "",
+        render_summary_table("zlib.recover", "zlib", runs),
+        "",
+        render_mismatches(runs),
+    ]
+    out = "\n".join(parts)
+
+    print(out)
+    if args.md:
+        Path("summary.md").write_text(out + "\n", encoding="utf-8")
+        print("[summarize_results] wrote: summary.md", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

@@ -18,6 +18,7 @@ import gzip
 import io
 import platform
 import struct
+import re
 import zlib
 from typing import Optional, Tuple
 
@@ -110,6 +111,12 @@ def run_zlib_recover(gz_bytes: bytes) -> Tuple[bool, Optional[int], Optional[str
         out = d.decompress(gz_bytes)
         # DO NOT call d.flush() here; we intentionally avoid final validations.
         return True, len(out), None
+    except zlib.error as e:
+        s = str(e)
+        # 例: "Error -5 while decompressing data" から -5 を抜く
+        m = re.search(r"Error\s+(-?\d+)", s)
+        short = m.group(1) if m else (s.split(":", 1)[0] or s)[:12]
+        return False, None, short  # 例: "-5" や "error" 相当の短い理由を返す
     except Exception as e:  # zlib.error, etc.
         return False, None, "error"
 
@@ -136,11 +143,11 @@ def print_table(rows):
 
 def main() -> None:
     # Environment header (human + machine-readable)
+    plat = f"{platform.platform()}"
     zlib_build = getattr(zlib, "ZLIB_VERSION", "?")
     zlib_rt = getattr(zlib, "ZLIB_RUNTIME_VERSION", zlib_build)
     pyver = platform.python_version()
-    print(f"Python {pyver} | gzip stdlib | zlib build={zlib_build} runtime={zlib_rt}")
-    print(f"## ENV PY={pyver} GZIP=stdlib ZLIB_BUILD={zlib_build} ZLIB_RUNTIME={zlib_rt}")
+    print(f"## ENV PY={pyver} GZIP=stdlib ZLIB_BUILD={zlib_build} ZLIB_RUNTIME={zlib_rt} PLATFORM={plat}")
 
     # Cases
     short_payload = b"HELLO WORLD!"  # 12 bytes
