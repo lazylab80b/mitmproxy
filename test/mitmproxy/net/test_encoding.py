@@ -135,30 +135,30 @@ class TestGzipMissingTrailerDecoding:
         out = encoding.decode_gzip(gz)
         assert out == payload
 
-    def test_decode_gzip_crc_byte_flip(self):
+    def test_decode_gzip_crc_byte_flip_error(self):
         good = gzip.compress(b"X" * 64)
         bad = bytearray(good)
         bad[-5] ^= 0xFF  # damage CRC32
         with pytest.raises(Exception):
             encoding.decode_gzip(bytes(bad))
 
-    def test_decode_gzip_isize_byte_flip(self):
+    def test_decode_gzip_isize_byte_flip_error(self):
         good = gzip.compress(b"HELLO")
         bad = bytearray(good)
         bad[-1] ^= 0xFF  # damage ISIZE LSB
         with pytest.raises(Exception):
             encoding.decode_gzip(bytes(bad))
 
-    @pytest.mark.xfail(strict=True, reason="last-byte-missing may be accepted by zlib")
-    def test_decode_gzip_last_byte_missing(self):
+    def test_decode_gzip_last_byte_missing_error(self):
         good = gzip.compress(b"HELLO")
-        encoding.decode_gzip(good[:-1])
+        with pytest.raises(EOFError):
+            encoding.decode_gzip(good[:-1])
 
 
 # test-local helpers / constants
 FROZEN_PAYLOAD = b'TRUNCATED-FROZEN'
 FROZEN_GZ_HEX = (
-    "1f8b08008eac996802ff0a090af573760c7175d1750bf28f72f503000000ffff"
+    "1f8b08000000000002ff0a090af573760c7175d1750bf28f72f503000000ffff"
 )
 
 def _gzip_truncated_no_trailer(payload: bytes, splits: int = 1) -> bytes:
@@ -167,7 +167,7 @@ def _gzip_truncated_no_trailer(payload: bytes, splits: int = 1) -> bytes:
     without a gzip trailer. Commonly leaves 00 00 ff ff markers near block boundaries.
     """
     buf = io.BytesIO()
-    gz = gzip.GzipFile(fileobj=buf, mode="wb")
+    gz = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
 
     n = max(1, splits)
     step = max(1, len(payload) // n)
