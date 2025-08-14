@@ -1,0 +1,12 @@
+## ENV PY=3.13.6 GZIP=stdlib ZLIB_BUILD=1.3.1 ZLIB_RUNTIME=1.2.8 PLATFORM=Linux-6.14.0-1012-gcp-x86_64-with-glibc2.41
+### BEGIN RESULTS
+| case               |  in | expect | stdlib.gzip           | zlib.recover        |
+|--------------------|----:|-------:|-----------------------|---------------------|
+| truncated(short)   |  34 |     12 | ERR(EOFError)         | OK(12/12)           |
+| truncated(long)    |  89 |  10240 | ERR(EOFError)         | OK(10240/10240)     |
+| crc_flip           |  24 |    256 | ERR(BadGzipFile)      | ERR(-3)             |
+| isize_flip         |  24 |    256 | ERR(BadGzipFile)      | ERR(-3)             |
+| last_byte_missing  |  23 |    256 | ERR(EOFError)         | OK(256/256)         |
+### END RESULTS
+SUMMARY: stdlib.gzip OK 0/5 | zlib.recover OK 3/5 | mismatches (gzip→ERR & zlib→OK): 3
+  truncated(short), truncated(long), last_byte_missing
