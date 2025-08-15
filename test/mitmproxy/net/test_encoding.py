@@ -117,16 +117,15 @@ def test_zstd():
     assert len(encoding.decode_zstd(two_frames)) == FRAME_SIZE * 2
 
 
-# test-local helpers / constants
-FROZEN_PAYLOAD = b'TRUNCATED-FROZEN'
-FROZEN_GZ_HEX = (
-    "1f8b08000000000002ff0a090af573760c7175d1750bf28f72f503000000ffff"
-)
-
 class TestGzipMissingTrailer:
     """
     Tests for #7795: gzip missing trailer (CRC32/ISIZE) but body is decodable.
     """
+    # test-local helpers / constants
+    FROZEN_PAYLOAD = b'TRUNCATED-FROZEN'
+    FROZEN_GZ_HEX = (
+        "1f8b08000000000002ff0a090af573760c7175d1750bf28f72f503000000ffff"
+    )
 
     @staticmethod
     def _gz_missing_trailer(payload: bytes, splits: int = 1) -> bytes:
@@ -174,7 +173,7 @@ class TestGzipMissingTrailer:
     def test_gzip_missing_trailer_decodes(self):
         """Test decoding missing trailer(Z_SYNC_FLUSH patter) leniently"""
         cases = [
-            ("frozen",  FROZEN_PAYLOAD, bytes.fromhex(FROZEN_GZ_HEX)),
+            ("frozen",  self.FROZEN_PAYLOAD, bytes.fromhex(self.FROZEN_GZ_HEX)),
             ("dynamic", b"TRUNCATED-DYNAMIC-" + b"A"*2048, None),
         ]
         for name, payload, corrupted in cases:
@@ -189,7 +188,7 @@ class TestGzipMissingTrailer:
 if __name__ == "__main__":
     import sys
 
-    payload = sys.argv[1].encode("utf-8") if len(sys.argv) > 1 else FROZEN_PAYLOAD
+    payload = sys.argv[1].encode("utf-8") if len(sys.argv) > 1 else TestGzipMissingTrailer.FROZEN_PAYLOAD
     gz = TestGzipMissingTrailer._gz_missing_trailer(payload)
     h = gz.hex()
 
@@ -197,6 +196,7 @@ if __name__ == "__main__":
         gzip.GzipFile(fileobj=io.BytesIO(gz)).read()
     except EOFError:
         print("gzip: expected EOFError detected (OK)")
+        print()
         IND = "    "
         HEX_PER_LINE = 64
         print(f"{IND}# -- COPY FROM HERE --")
@@ -206,6 +206,7 @@ if __name__ == "__main__":
             print(f'{IND}    "{h[i:i+HEX_PER_LINE]}"')
         print(f"{IND})")
         print(f"{IND}# -- TO HERE --")
+        print()
     else:
         print("gzip: unexpected success (NG)")
         sys.exit(1)
