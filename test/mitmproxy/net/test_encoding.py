@@ -187,26 +187,47 @@ class TestGzipMissingTrailer:
 #   $ uv run python test/mitmproxy/net/test_encoding.py "payload text"
 if __name__ == "__main__":
     import sys
+    from typing import Iterable, List
+
+    IND = "    "
+    BYTES_PER_LINE = 16
+
+    def _indent(texts, levels: int = 1) -> None:
+        """Print a string or list with indentation."""
+        prefix = IND * max(0, levels)
+        lines = [texts] if isinstance(texts, str) else texts
+        for line in lines:
+            print(prefix + line)
 
     payload = sys.argv[1].encode("utf-8") if len(sys.argv) > 1 else TestGzipMissingTrailer.FROZEN_PAYLOAD
     gz = TestGzipMissingTrailer._gz_missing_trailer(payload)
-    h = gz.hex()
+    hexstr = gz.hex()
 
     try:
         gzip.GzipFile(fileobj=io.BytesIO(gz)).read()
     except EOFError:
         print("gzip: expected EOFError detected (OK)")
-        print()
-        IND = "    "
-        HEX_PER_LINE = 64
-        print(f"{IND}# -- COPY FROM HERE --")
-        print(f"{IND}FROZEN_PAYLOAD = {payload!r}")
-        print(f"{IND}FROZEN_GZ_HEX = (")
-        for i in range(0, len(h), HEX_PER_LINE):
-            print(f'{IND}    "{h[i:i+HEX_PER_LINE]}"')
-        print(f"{IND})")
-        print(f"{IND}# -- TO HERE --")
-        print()
+
+        hex_lines: List[str] = []
+        payload_lines: List[str] = []
+
+        step = BYTES_PER_LINE * 4
+        for i in range(0, len(hexstr), step):
+            hex_lines.append(f'"{hexstr[i:i+step]}"')
+
+        b = bytes(payload)
+        step = BYTES_PER_LINE
+        for i in range(0, len(b), step):
+            payload_lines.append(repr(b[i:i+step]))
+
+        _indent("# -- COPY FROM HERE --", 1)
+        _indent("FROZEN_PAYLOAD = (", 1)
+        _indent(payload_lines, 2)
+        _indent(")", 1)
+        _indent("FROZEN_GZ_HEX = (", 1)
+        _indent(hex_lines, 2)
+        _indent(")", 1)
+        _indent("# -- TO HERE --", 1)
     else:
         print("gzip: unexpected success (NG)")
         sys.exit(1)
