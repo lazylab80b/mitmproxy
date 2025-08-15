@@ -1233,7 +1233,7 @@ class TestMessageText:
 
     @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer (issue-derived)")
     def test_get_text_gzip_missing_trailer_issue7795(self):
-    # Regression for #7795: issue-provided truncated gzip (no trailer), but body is decodable.
+        """Integration test for #7795: issue-provided truncated gzip (no trailer)."""
         hexdata = (
             "1f8b08000000000000ffaa564a2d2a72ce4f4955b2d235d551502a4a2df12d4e57b2"
             "527ab17efbb38d4d4f7b5a9fec58fb6cd3c267733a934a3353946a01000000ffff"

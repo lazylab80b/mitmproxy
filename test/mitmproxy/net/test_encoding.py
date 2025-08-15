@@ -117,66 +117,71 @@ def test_zstd():
     assert len(encoding.decode_zstd(two_frames)) == FRAME_SIZE * 2
 
 
-# Tests for #7795: gzip missing trailer (CRC32/ISIZE) but body is decodable.
-# Unit covers: (1) frozen synthetic, (2) dynamic multi-block, (3) guardrails (CRC/ISIZE).
-# Note: last-byte-missing is XFAIL (zlib commonly accepts it).
-class TestGzipMissingTrailerDecoding:
-    @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer (frozen synthetic)")
-    def test_decode_gzip_missing_trailer_frozen(self):
-        gz = bytes.fromhex(FROZEN_GZ_HEX)
-        out = encoding.decode_gzip(gz)
-        assert out == FROZEN_PAYLOAD
-
-    @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer (dynamic)")
-    def test_decode_gzip_missing_trailer_dynamic(self):
-        payload = b"TRUNCATED-DYNAMIC-" + b"A" * 2048
-        # The `splits` parameter forces multiple chunks so we get multiple blocks.
-        gz = _gzip_truncated_no_trailer(payload, splits=3)
-        out = encoding.decode_gzip(gz)
-        assert out == payload
-
-    def test_decode_gzip_crc_byte_flip_error(self):
-        good = gzip.compress(b"X" * 64)
-        bad = bytearray(good)
-        bad[-5] ^= 0xFF  # damage CRC32
-        with pytest.raises(Exception):
-            encoding.decode_gzip(bytes(bad))
-
-    def test_decode_gzip_isize_byte_flip_error(self):
-        good = gzip.compress(b"HELLO")
-        bad = bytearray(good)
-        bad[-1] ^= 0xFF  # damage ISIZE LSB
-        with pytest.raises(Exception):
-            encoding.decode_gzip(bytes(bad))
-
-    def test_decode_gzip_last_byte_missing_error(self):
-        good = gzip.compress(b"HELLO")
-        with pytest.raises(EOFError):
-            encoding.decode_gzip(good[:-1])
-
-
 # test-local helpers / constants
 FROZEN_PAYLOAD = b'TRUNCATED-FROZEN'
 FROZEN_GZ_HEX = (
     "1f8b08000000000002ff0a090af573760c7175d1750bf28f72f503000000ffff"
 )
 
-def _gzip_truncated_no_trailer(payload: bytes, splits: int = 1) -> bytes:
+class TestGzipMissingTrailer:
     """
-    Build a truncated gzip stream by flushing between chunks so the stream ends
-    without a gzip trailer. Commonly leaves 00 00 ff ff markers near block boundaries.
+    Tests for #7795: gzip missing trailer (CRC32/ISIZE) but body is decodable.
     """
-    buf = io.BytesIO()
-    gz = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
 
-    n = max(1, splits)
-    step = max(1, len(payload) // n)
-    for i in range(0, len(payload), step):
-        gz.write(payload[i:i+step])
-        gz.flush(zlib.Z_SYNC_FLUSH)  # force a block boundary; do not finish the stream
-    data = buf.getvalue()  # read before close to avoid writing the trailer
-    gz.close()
-    return data
+    @staticmethod
+    def _gz_missing_trailer(payload: bytes, splits: int = 1) -> bytes:
+        """
+        Return a gzip stream missing the final CRC/ISIZE trailer by Z_SYNC_FLUSH.
+        """
+        buf = io.BytesIO()
+        gz = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
+
+        n = max(1, splits)
+        step = max(1, len(payload) // n)
+        for i in range(0, len(payload), step):
+            gz.write(payload[i:i+step])
+            gz.flush(zlib.Z_SYNC_FLUSH)  # force a block boundary; do not finish the stream
+        data = buf.getvalue()  # read before close to avoid writing the trailer
+        gz.close()
+        return data
+
+    @staticmethod
+    def _flip_crc(b: bytes) -> bytes:
+        x = bytearray(b); x[-5] ^= 0xFF; return bytes(x)
+    
+    @staticmethod
+    def _flip_isize(b: bytes) -> bytes:
+        x = bytearray(b); x[-1] ^= 0xFF; return bytes(x)
+
+    @staticmethod
+    def _drop_last_byte(b: bytes) -> bytes:
+        return b[:-1]
+
+    def test_gzip_trailer_corrupt_raises(self):
+        """Test decoding corrupted gzip data raises"""
+        gz = gzip.compress(b"HELLO")
+        corruptors = [
+            ("crc_flip", self._flip_crc),
+            ("isize_flip", self._flip_isize),
+            ("last_byte_missing", self._drop_last_byte),
+        ]
+        for name, fn in corruptors:
+            corrupted = fn(gz)
+            with pytest.raises(Exception):
+                encoding.decode_gzip(corrupted)
+
+    @pytest.mark.xfail(strict=True, reason="#7795: gzip missing trailer should be decodable (pre-fix)")
+    def test_gzip_missing_trailer_decodes(self):
+        """Test decoding missing trailer(Z_SYNC_FLUSH patter) leniently"""
+        cases = [
+            ("frozen",  FROZEN_PAYLOAD, bytes.fromhex(FROZEN_GZ_HEX)),
+            ("dynamic", b"TRUNCATED-DYNAMIC-" + b"A"*2048, None),
+        ]
+        for name, payload, corrupted in cases:
+            if corrupted is None:
+                corrupted = self._gz_missing_trailer(payload, splits=3)
+            out = encoding.decode_gzip(corrupted)
+            assert out == payload
 
 # Local-only helper to print FROZEN_GZ_HEX and sanity-check stdlib gzip failure.
 # Run this file and paste the printed block into the frozen constants section above.
@@ -185,20 +190,22 @@ if __name__ == "__main__":
     import sys
 
     payload = sys.argv[1].encode("utf-8") if len(sys.argv) > 1 else FROZEN_PAYLOAD
-    gz = _gzip_truncated_no_trailer(payload)
+    gz = TestGzipMissingTrailer._gz_missing_trailer(payload)
     h = gz.hex()
 
     try:
         gzip.GzipFile(fileobj=io.BytesIO(gz)).read()
     except EOFError:
         print("gzip: expected EOFError detected (OK)")
-        print("# -- COPY FROM HERE --")
-        print(f"FROZEN_PAYLOAD = {payload!r}")
-        print("FROZEN_GZ_HEX = (")
-        for i in range(0, len(h), 80):
-            print(f'    "{h[i:i+80]}"')
-        print(")")
-        print("# -- TO HERE --")
+        IND = "    "
+        HEX_PER_LINE = 64
+        print(f"{IND}# -- COPY FROM HERE --")
+        print(f"{IND}FROZEN_PAYLOAD = {payload!r}")
+        print(f"{IND}FROZEN_GZ_HEX = (")
+        for i in range(0, len(h), HEX_PER_LINE):
+            print(f'{IND}    "{h[i:i+HEX_PER_LINE]}"')
+        print(f"{IND})")
+        print(f"{IND}# -- TO HERE --")
     else:
         print("gzip: unexpected success (NG)")
         sys.exit(1)
