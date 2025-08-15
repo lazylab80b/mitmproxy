@@ -184,50 +184,49 @@ class TestGzipMissingTrailer:
 
 # Local-only helper to print FROZEN_GZ_HEX and sanity-check stdlib gzip failure.
 # Run this file and paste the printed block into the frozen constants section above.
-#   $ uv run python test/mitmproxy/net/test_encoding.py "payload text"
+#   $ uv run python test/mitmproxy/net/test_encoding.py "payload text"
 if __name__ == "__main__":
     import sys
-    from typing import Iterable, List
-
-    IND = "    "
-    BYTES_PER_LINE = 16
-
-    def _indent(texts, levels: int = 1) -> None:
-        """Print a string or list with indentation."""
-        prefix = IND * max(0, levels)
+    import io
+    
+    INDENT_STRING = "    "
+    def _indent(levels: int, texts) -> None:
+        """Prints a string or list of strings with indentation."""
+        prefix = INDENT_STRING * max(0, levels)
         lines = [texts] if isinstance(texts, str) else texts
         for line in lines:
             print(prefix + line)
 
     payload = sys.argv[1].encode("utf-8") if len(sys.argv) > 1 else TestGzipMissingTrailer.FROZEN_PAYLOAD
     gz = TestGzipMissingTrailer._gz_missing_trailer(payload)
-    hexstr = gz.hex()
 
     try:
         gzip.GzipFile(fileobj=io.BytesIO(gz)).read()
     except EOFError:
         print("gzip: expected EOFError detected (OK)")
 
-        hex_lines: List[str] = []
-        payload_lines: List[str] = []
+        payload_lines = []
+        hex_lines = []
 
-        step = BYTES_PER_LINE * 4
+        # PAYLOAD: 16 bytes/line
+        step = 16
+        for i in range(0, len(payload), step):
+            payload_lines.append(repr(payload[i:i+step]))
+
+        # HEX: 64 chars/line (=32 bytes)
+        step = 64
+        hexstr = gz.hex()
         for i in range(0, len(hexstr), step):
             hex_lines.append(f'"{hexstr[i:i+step]}"')
 
-        b = bytes(payload)
-        step = BYTES_PER_LINE
-        for i in range(0, len(b), step):
-            payload_lines.append(repr(b[i:i+step]))
-
-        _indent("# -- COPY FROM HERE --", 1)
-        _indent("FROZEN_PAYLOAD = (", 1)
-        _indent(payload_lines, 2)
-        _indent(")", 1)
-        _indent("FROZEN_GZ_HEX = (", 1)
-        _indent(hex_lines, 2)
-        _indent(")", 1)
-        _indent("# -- TO HERE --", 1)
+        _indent(1, "# -- COPY FROM HERE --")
+        _indent(1, "FROZEN_PAYLOAD = (")
+        _indent(2, payload_lines)
+        _indent(1, ")")
+        _indent(1, "FROZEN_GZ_HEX = (")
+        _indent(2, hex_lines)
+        _indent(1, ")")
+        _indent(1, "# -- TO HERE --")
     else:
         print("gzip: unexpected success (NG)")
         sys.exit(1)
